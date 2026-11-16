@@ -1,17 +1,37 @@
 #include <Arduino.h>
+#include <Modbus.h>       // 명시적 추가
+#include <ModbusRTU.h>    // 카메라 헤더보다 먼저 선언
 #include <WiFi.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include "img_converters.h"
 
+
 // ==========================================
-// 1. Wi-Fi 설정 (본인 환경에 맞게 수정 필수)
+// 1. 운용 모드 스위치 (매우 중요!)
+// ==========================================
+// true  : PC USB(ESP32-CAM-MB) 연결 시 시리얼 모니터 디버깅 및 Wi-Fi 스트리밍 활성
+// false : 현장 RS485(PLC) 연결 시 순수 Modbus RTU 슬레이브로 동작 (MB 보드 분리 필수)
+#define ENABLE_DEBUG_MODE true
+
+// ==========================================
+// 2. Wi-Fi 및 Modbus RTU 설정
 // ==========================================
 const char* ssid = "1실습실_2.4G";
 const char* password = "tank5000";
 
+#define SLAVE_ID        1       // Modbus 슬레이브 국번 (1번)
+#define MODBUS_BAUD     9600    // PLC 통신 속도와 일치시킬 것
+#define RS485_DE_RE_PIN 13      // MAX485 DE/RE 핀 연결 번호
+
+// Modbus 레지스터 주소 정의
+#define REG_COLOR_CODE  0       // 40001: 색상 숫자 코드
+#define REG_R_VAL       1       // 40002: R 값
+#define REG_G_VAL       2       // 40003: G 값
+#define REG_B_VAL       3       // 40004: B 값
+
 // ==========================================
-// 2. AI-Thinker ESP32-CAM 핀 정의
+// 3. AI-Thinker ESP32-CAM 핀 정의
 // ==========================================
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -30,17 +50,18 @@ const char* password = "tank5000";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
+ModbusRTU mb;
 httpd_handle_t stream_httpd = NULL;
-volatile bool isStreaming = false; // 웹 브라우저 접속 여부 플래그
+volatile bool isStreaming = false;
 
-// 최신 측정 결과 공유 변수
 int curR = 0, curG = 0, curB = 0;
-String curColor = "초기화 중...";
+uint16_t curColorCode = 0;
 
 // ==========================================
-// 3. 6가지 색상 판별 함수 (RGB -> HSV + 각도 보정)
+// 4. 6가지 색상 판별 함수 (숫자 코드 반환)
 // ==========================================
-String detectCubeColor(int r, int g, int b) {
+// 반환값: 0(미감지), 1(흰색), 2(검정), 3(빨강), 4(노랑), 5(초록), 6(파랑)
+uint16_t detectCubeColorCode(int r, int g, int b) {
   float rf = r / 255.0f;
   float gf = g / 255.0f;
   float bf = b / 255.0f;
@@ -49,57 +70,49 @@ String detectCubeColor(int r, int g, int b) {
   float minVal = min(rf, min(gf, bf));
   float delta = maxVal - minVal;
 
-  // 명도(V: 0~100%) 및 채도(S: 0~100%) 계산
   float v = maxVal * 100.0f;
   float s = (maxVal == 0) ? 0 : (delta / maxVal) * 100.0f;
 
-  // 무채색(검정색, 흰색) 우선 판별
-  if (v < 25.0f) {
-    return "BLACK (검정색)";
-  }
-  if (v > 75.0f && s < 22.0f) {
-    return "WHITE (흰색)";
-  }
-  // 채도가 낮으면 배경 또는 회색조로 처리
-  if (s < 25.0f) {
-    return "UNKNOWN (배경/회색조)";
-  }
+  if (v < 25.0f) return 2;                   // 검정색 (BLACK)
+  if (v > 75.0f && s < 22.0f) return 1;      // 흰색 (WHITE)
+  if (s < 25.0f) return 0;                   // 미감지/배경 (UNKNOWN)
 
-  // 색상 각도(Hue: 0~360도) 계산
   float h = 0;
   if (delta > 0) {
-    if (maxVal == rf) {
-      h = 60.0f * fmod(((gf - bf) / delta), 6.0f);
-    } else if (maxVal == gf) {
-      h = 60.0f * (((bf - rf) / delta) + 2.0f);
-    } else {
-      h = 60.0f * (((rf - gf) / delta) + 4.0f);
-    }
+    if (maxVal == rf) h = 60.0f * fmod(((gf - bf) / delta), 6.0f);
+    else if (maxVal == gf) h = 60.0f * (((bf - rf) / delta) + 2.0f);
+    else h = 60.0f * (((rf - gf) / delta) + 4.0f);
   }
   if (h < 0) h += 360.0f;
 
-  // Hue 각도 구간별 4대 유채색 판별 (보정된 경계값 적용)
-  if (h >= 335.0f || h < 32.0f) {
-    return "RED (빨간색)";
-  } else if (h >= 32.0f && h < 82.0f) {
-    return "YELLOW (노란색)";
-  } else if (h >= 82.0f && h < 165.0f) {
-    return "GREEN (초록색)";
-  } else if (h >= 165.0f && h < 260.0f) {
-    return "BLUE (파란색)";
-  }
+  if (h >= 335.0f || h < 32.0f) return 3;    // 빨간색 (RED)
+  if (h >= 32.0f && h < 82.0f) return 4;     // 노란색 (YELLOW)
+  if (h >= 82.0f && h < 165.0f) return 5;    // 초록색 (GREEN)
+  if (h >= 165.0f && h < 260.0f) return 6;   // 파란색 (BLUE)
 
-  return "UNKNOWN (미분류)";
+  return 0;                                  // 미분류
+}
+
+// 색상 숫자 코드를 한글 이름으로 변환하는 헬퍼 함수
+const char* getColorName(uint16_t code) {
+  switch (code) {
+    case 1: return "흰색";
+    case 2: return "검정색";
+    case 3: return "빨간색";
+    case 4: return "노란색";
+    case 5: return "초록색";
+    case 6: return "파란색";
+    default: return "미감지";
+  }
 }
 
 // ==========================================
-// 4. 단일 프레임 분석 및 가이드라인 그리기 함수
+// 5. 프레임 분석 및 Modbus 레지스터 갱신
 // ==========================================
 void processFrame(camera_fb_t *fb) {
   long sumR = 0, sumG = 0, sumB = 0;
   int pixelCount = 0;
 
-  // 중앙 가이드라인 안쪽 픽셀 평균 계산 (X: 62~98, Y: 42~78)
   for (int y = 42; y < 79; y++) {
     for (int x = 62; x < 99; x++) {
       int idx = (y * fb->width + x) * 2;
@@ -109,7 +122,7 @@ void processFrame(camera_fb_t *fb) {
       int g = ((pixel >> 5) & 0x3F) * 255 / 63;
       int b = (pixel & 0x1F) * 255 / 31;
 
-      // 녹색 치우침(Green Tint) 보정 (R +15%, G -15%)
+      // 녹색 치우침 보정
       r = min(255, (int)(r * 1.15f));
       g = (int)(g * 0.85f);
 
@@ -123,63 +136,59 @@ void processFrame(camera_fb_t *fb) {
   curR = sumR / pixelCount;
   curG = sumG / pixelCount;
   curB = sumB / pixelCount;
-  curColor = detectCubeColor(curR, curG, curB);
+  curColorCode = detectCubeColorCode(curR, curG, curB);
 
-  // 웹 화면용 초록색 가이드 박스 그리기 (RGB565 엔디안 반전: 0xE007)
-  uint16_t *buf16 = (uint16_t *)fb->buf;
-  for (int x = 60; x <= 100; x++) {
-    buf16[40 * fb->width + x] = 0xE007;
-    buf16[80 * fb->width + x] = 0xE007;
+  // Modbus 홀딩 레지스터에 최신 측정값 업데이트
+  if (!ENABLE_DEBUG_MODE) {
+    mb.Hreg(REG_COLOR_CODE, curColorCode);
+    mb.Hreg(REG_R_VAL, (uint16_t)curR);
+    mb.Hreg(REG_G_VAL, (uint16_t)curG);
+    mb.Hreg(REG_B_VAL, (uint16_t)curB);
   }
-  for (int y = 40; y <= 80; y++) {
-    buf16[y * fb->width + 60] = 0xE007;
-    buf16[y * fb->width + 100] = 0xE007;
+
+  // 디버깅 모드일 때만 웹 스트리밍용 가이드 박스 그리기
+  if (ENABLE_DEBUG_MODE) {
+    uint16_t *buf16 = (uint16_t *)fb->buf;
+    for (int x = 60; x <= 100; x++) {
+      buf16[40 * fb->width + x] = 0xE007;
+      buf16[80 * fb->width + x] = 0xE007;
+    }
+    for (int y = 40; y <= 80; y++) {
+      buf16[y * fb->width + 60] = 0xE007;
+      buf16[y * fb->width + 100] = 0xE007;
+    }
   }
 }
 
 // ==========================================
-// 5. 웹 브라우저 실시간 스트리밍 핸들러
+// 6. 웹 스트리밍 서버 (디버깅 모드 전용)
 // ==========================================
 static esp_err_t stream_handler(httpd_req_t *req) {
   camera_fb_t *fb = NULL;
   esp_err_t res = ESP_OK;
   size_t _jpg_buf_len = 0;
   uint8_t *_jpg_buf = NULL;
-  char part_buf[64]; // 버퍼 배열 크기 명시
+  char part_buf[64];
 
   isStreaming = true;
   res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
 
   while (res == ESP_OK) {
     fb = esp_camera_fb_get();
-    if (!fb) {
-      res = ESP_FAIL;
-      break;
-    }
-
-    processFrame(fb); // 스트리밍 중 프레임 분석 동시 수행
-
+    if (!fb) { res = ESP_FAIL; break; }
+    processFrame(fb);
     bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
     esp_camera_fb_return(fb);
     fb = NULL;
-
-    if (!jpeg_converted) {
-      res = ESP_FAIL;
-      break;
-    }
+    if (!jpeg_converted) { res = ESP_FAIL; break; }
 
     size_t hlen = snprintf(part_buf, sizeof(part_buf), "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", _jpg_buf_len);
     res = httpd_resp_send_chunk(req, part_buf, hlen);
     if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
     if (res == ESP_OK) res = httpd_resp_send_chunk(req, "\r\n--frame\r\n", 12);
-
-    if (_jpg_buf) {
-      free(_jpg_buf);
-      _jpg_buf = NULL;
-    }
-    delay(30); // CPU 점유율 완화
+    if (_jpg_buf) { free(_jpg_buf); _jpg_buf = NULL; }
+    delay(30);
   }
-
   isStreaming = false;
   return res;
 }
@@ -187,20 +196,16 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
-  httpd_uri_t index_uri = {
-    .uri       = "/",
-    .method    = HTTP_GET,
-    .handler   = stream_handler,
-    .user_ctx  = NULL
-  };
+  httpd_uri_t index_uri = { .uri = "/", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL };
   if (httpd_start(&stream_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(stream_httpd, &index_uri);
   }
 }
 
+// ==========================================
+// 7. 초기 설정 (Setup)
+// ==========================================
 void setup() {
-  Serial.begin(115200);
-  
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -220,20 +225,16 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  
-  // 오버플로우(EV-VSYNC-OVF) 방지를 위해 XCLK를 10MHz로 설정
-  config.xclk_freq_hz = 10000000; 
+  config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_RGB565;
-  config.frame_size = FRAMESIZE_QQVGA; // 160x120
+  config.frame_size = FRAMESIZE_QQVGA;
   config.fb_count = 1;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
   if (esp_camera_init(&config) != ESP_OK) {
-    Serial.println("[Error] 카메라 초기화 실패");
-    return;
+    while (true) { delay(1000); }
   }
 
-  // 부팅 직후 1.5초간 현재 조명에 맞춰 화이트밸런스 보정 후 고정
   sensor_t *s = esp_camera_sensor_get();
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
@@ -241,34 +242,53 @@ void setup() {
   s->set_whitebal(s, 0);
   s->set_awb_gain(s, 0);
 
-  WiFi.begin(ssid, password);
-  Serial.print("Wi-Fi 연결 중");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\n[Info] Wi-Fi 연결 완료!");
-  Serial.print("[Info] 브라우저 접속 주소: http://");
-  Serial.println(WiFi.localIP());
+  if (ENABLE_DEBUG_MODE) {
+    // [모드 1] PC 디버깅 및 웹 화면 확인 모드
+    Serial.begin(115200);
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) { delay(500); }
+    Serial.print("\n[Info] 브라우저 접속 주소: http://");
+    Serial.println(WiFi.localIP());
+    startCameraServer();
+  } else {
+    // [모드 2] 현장 Modbus RTU 슬레이브 운용 모드 (Wi-Fi OFF로 전력 및 안정성 극대화)
+    WiFi.mode(WIFI_OFF);
+    Serial.begin(MODBUS_BAUD, SERIAL_8N1);
+    mb.begin(&Serial, RS485_DE_RE_PIN); // GPIO 13을 DE/RE 제어 핀으로 자동 사용
+    mb.slave(SLAVE_ID);
 
-  startCameraServer();
+    // 홀딩 레지스터 0~3번 생성 및 초기화
+    mb.addHreg(REG_COLOR_CODE, 0);
+    mb.addHreg(REG_R_VAL, 0);
+    mb.addHreg(REG_G_VAL, 0);
+    mb.addHreg(REG_B_VAL, 0);
+  }
 }
 
+// ==========================================
+// 8. 메인 루프
+// ==========================================
 void loop() {
-  static unsigned long lastPrint = 0;
+  static unsigned long lastScan = 0;
 
-  // 웹 스트리밍 미사용 시에도 백그라운드에서 색상 감지 수행
-  if (!isStreaming) {
+  if (!ENABLE_DEBUG_MODE) {
+    // Modbus RTU 폴링 처리 (PLC 요청에 즉각 응답하기 위해 루프 최상단에서 계속 호출)
+    mb.task();
+  }
+
+  // 0.1초(100ms) 주기로 카메라 프레임 캡처 및 색상 업데이트
+  if (!isStreaming && (millis() - lastScan >= 100)) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) {
       processFrame(fb);
       esp_camera_fb_return(fb);
     }
-  }
 
-  // 0.3초 간격으로 시리얼 모니터에 결과 출력
-  if (millis() - lastPrint >= 300) {
-    Serial.printf("R:%3d G:%3d B:%3d --> %s\n", curR, curG, curB, curColor.c_str());
-    lastPrint = millis();
+    if (ENABLE_DEBUG_MODE) {
+      // Serial.printf("Code:%d | R:%3d G:%3d B:%3d\n", curColorCode, curR, curG, curB);
+      Serial.printf("%d: %s (R:%3d G:%3d B:%3d)\n", curColorCode, getColorName(curColorCode), curR, curG, curB);
+    }
+
+    lastScan = millis();
   }
 }
