@@ -95,12 +95,26 @@ const int           STABLE_FRAMES   = 5;     // 위치·면적이 변하지 않�
 const unsigned long STABLE_MIN_MS   = 300;   // 그리고 처음 감지 후 최소 경과 시간
 const float         STABLE_MOVE_PX  = 1.5f;  // 프레임 간 중심 이동 허용치(px)
 const float         STABLE_AREA_PCT = 0.12f; // 프레임 간 면적 변화 허용치
-const int           EMPTY_FRAMES    = 4;     // 연속 이만큼 비어 있으면 '물체 제거'
+const int           EMPTY_FRAMES    = 4;     // 안정화 중: 연속 이만큼 판이 비어 있으면 취소
 
-// 빈 판 상태가 오래 유지되면 조명 변화를 따라가도록 배경을 천천히 갱신
+// 물체 제거 판정 — '확정된 물체가 있던 자리(풋프린트)'만 본다
+//   예전 방식(ROI 전체에 덩어리가 하나도 없어야 제거)은 물체를 치운 뒤에도
+//   작업자 팔·판 반사·조명 얼룩 등 다른 덩어리가 하나만 남아 있으면 제거를 놓쳤다.
+const float REMOVE_OCC_MAX = 0.35f;  // 풋프린트 중 전경 픽셀 비율이 35% 미만이면 '비었음'
+const int   REMOVE_FRAMES  = 4;      // 연속 이만큼 비어 있으면 '물체 제거'
+
+// 교체 판정 — 빈 프레임 없이 같은 자리에 다른 물체가 놓인 경우 (빠른 교체)
+const float         CHANGE_OVERLAP_MIN = 0.5f;   // 현재 덩어리가 풋프린트와 이만큼 겹쳐야 '같은 자리'
+const float         CHANGE_AREA_PCT    = 0.25f;  // |면적 차| / 큰 쪽 면적 ≥ 25% → 크기가 다름 (소:중:대 ≈ 1:1.57:2.43)
+const int           CHANGE_FRAMES      = 10;     // 이만큼 연속으로 (안정된 상태로) 달라 보여야 교체
+const unsigned long CHANGE_MIN_MS      = 600;
+
+// 조명 변화를 따라가도록 배경을 천천히 갱신 (모든 상태에서)
+//   배경과 차이가 작은 픽셀만 갱신하므로 물체·그림자·손은 배경에 흡수되지 않는다.
+//   → 물체가 오래 놓여 있는 동안 주변 판 밝기가 변해도, 치운 뒤 얼룩(유령 덩어리)이 남지 않음
 const int BG_AVG_FRAMES   = 8;    // 배경 학습 시 평균 낼 프레임 수
-const int BG_UPDATE_AFTER = 30;   // 빈 판이 이 프레임 수 이상 지속되면
-const int BG_UPDATE_EVERY = 10;   // 이 프레임마다 1/8 비율로 갱신
+const int BG_UPDATE_EVERY = 10;   // 이 프레임마다 갱신
+const int BG_TRACK_MAX    = 24;   // |ΔR|+|ΔG|+|ΔB| 가 이 이하인 픽셀만 갱신 (DIFF_THRESH·CHROMA_THRESH보다 충분히 작게)
 
 // ==========================================
 // 8. AI-Thinker ESP32-CAM 핀 정의
@@ -175,6 +189,21 @@ unsigned long settleStart = 0;
 BlobInfo prevBlob;
 bool settleWarned = false;
 
+// 확정된 물체의 위치(풋프린트) — 제거/교체 판정 기준
+uint8_t *footMask = nullptr;   // 1 = 확정 당시 물체 픽셀
+int      footArea = 0;
+BlobInfo confBlob;             // 확정 당시 덩어리
+
+struct FootCheck {
+  float occ = 0;               // 풋프린트 중 현재 전경인 픽셀 비율 (1 = 그대로 있음, 0 = 비었음)
+  float bestOverlap = 0;       // 현재 최대 덩어리와 풋프린트의 겹침 / 둘 중 작은 면적
+};
+FootCheck lastFoot;
+int removeStreak = 0;          // 풋프린트가 비어 보인 연속 프레임
+int changeCount = 0;           // 같은 자리에 다른 물체로 보인 연속 프레임
+unsigned long changeStart = 0;
+BlobInfo changePrev;
+
 // 안정화 구간 누적값
 int   accColorVotes[8];
 long  accRgb[8][3];
@@ -208,6 +237,8 @@ struct DebugStatus {
   int stableCount = 0;
   BlobInfo blob;
   ColorInfo color;
+  FootCheck foot;
+  int footArea = 0, removeStreak = 0, changeCount = 0;
   float fps = 0;
   uint32_t frameNo = 0;
 } dbgStatus;
@@ -326,6 +357,14 @@ void computePlateStats() {
   gainB8 = lroundf(gainB * 256);
 }
 
+// 배경 갱신 한 걸음: 차이의 1/8, 최소 1 단계
+//   (단순 /8 은 채널당 차이가 8 미만이면 0이 되어, 작은 차이만 허용하는 갱신에서는 영영 따라가지 못한다)
+static inline int bgStep(int d) {
+  if (d > 0) return max(1, d / 8);
+  if (d < 0) return min(-1, d / 8);
+  return 0;
+}
+
 // 판 기준 화이트밸런스 적용 후의 채도(최대-최소)
 //   센서 색조(예: AWB 고정 시 녹색 기운) 때문에 판 자체 채도가 40 가까이 나오면
 //   주황빛으로 찍히는 빨간 큐브와 구분이 약해지므로, 보정 공간에서 비교한다.
@@ -339,6 +378,10 @@ void resetDetectionState() {
   emptyStreak = 0;
   stableCount = 0;
   accFrames = 0;
+  footArea = 0;
+  removeStreak = 0;
+  changeCount = 0;
+  lastFoot = FootCheck();
   if (!ENABLE_DEBUG_MODE) mb.Hreg(REG_PRESENT, 0);
 }
 
@@ -550,6 +593,7 @@ static uint16_t maskColor(int i, int x, int y) {
   }
   if (v == 3) return 0x07FF;      // 선택 덩어리 가장자리 (색 판정 제외)
   if (v == 2) return 0x8410;      // 다른 덩어리
+  if (detState == ST_CONFIRMED && footMask[i]) return 0x7800;  // 확정 위치 중 비어 보이는 부분
   if (fgRaw[i]) return 0x2945;    // 필터로 제거된 노이즈
   return 0x0000;
 }
@@ -598,6 +642,10 @@ static void renderDebug(const camera_fb_t *fb, const BlobInfo &best, const Color
   dbgStatus.stableCount = stableCount;
   dbgStatus.blob = best;
   dbgStatus.color = ci;
+  dbgStatus.foot = lastFoot;
+  dbgStatus.footArea = detState == ST_CONFIRMED ? footArea : 0;
+  dbgStatus.removeStreak = removeStreak;
+  dbgStatus.changeCount = changeCount;
   dbgStatus.fps = fps;
   dbgStatus.frameNo = frameNo;
   dbgFrameId = dbgFrameId + 1;
@@ -627,6 +675,70 @@ static bool isSameBlob(const BlobInfo &a, const BlobInfo &b) {
   float areaTol = max(8.0f, a.area * STABLE_AREA_PCT);
   return fabsf(a.cx - b.cx) <= STABLE_MOVE_PX && fabsf(a.cy - b.cy) <= STABLE_MOVE_PX &&
          fabsf((float)(a.area - b.area)) <= areaTol;
+}
+
+// 확정 순간의 선택 덩어리(fgMap >= 3)를 풋프린트로 저장
+static void saveFootprint(const BlobInfo &b) {
+  memset(footMask, 0, IMG_N);
+  footArea = 0;
+  for (int y = ROI_Y0; y <= ROI_Y1; y++) {
+    for (int x = ROI_X0; x <= ROI_X1; x++) {
+      int i = y * IMG_W + x;
+      if (fgMap[i] >= 3) { footMask[i] = 1; footArea++; }
+    }
+  }
+  confBlob = b;
+  removeStreak = 0;
+  changeCount = 0;
+}
+
+// 풋프린트가 지금도 전경(배경과 다름)인지 — ROI의 다른 곳에 무엇이 있든 영향받지 않는다
+static FootCheck checkFootprint(const BlobInfo &best) {
+  FootCheck fc;
+  if (footArea <= 0) return fc;
+  int fg = 0, inBest = 0;
+  for (int y = ROI_Y0; y <= ROI_Y1; y++) {
+    for (int x = ROI_X0; x <= ROI_X1; x++) {
+      int i = y * IMG_W + x;
+      if (!footMask[i] || !fgMap[i]) continue;
+      fg++;
+      if (fgMap[i] >= 3) inBest++;      // 현재 최대 덩어리에 속함
+    }
+  }
+  fc.occ = (float)fg / footArea;
+  int denom = min(footArea, best.area);
+  fc.bestOverlap = denom > 0 ? (float)inBest / denom : 0;
+  return fc;
+}
+
+static bool isAchromaticCode(uint16_t c) { return c == 1 || c == 2; }
+
+// 같은 자리의 현재 물체가 확정된 물체와 크기 또는 색이 다른가
+static bool isDifferentObject(const BlobInfo &b, const ColorInfo &ci, const FootCheck &fc) {
+  if (!b.valid || fc.bestOverlap < CHANGE_OVERLAP_MIN) return false;
+  int bigger = max(b.area, confBlob.area);
+  bool areaChanged = bigger > 0 && abs(b.area - confBlob.area) >= bigger * CHANGE_AREA_PCT;
+  // 흰↔검은 그림자에 따라 뒤집힐 수 있어 교체 근거로 쓰지 않는다
+  bool colorChanged = ci.code != 0 && ci.code != curColorCode &&
+                      !(isAchromaticCode(ci.code) && isAchromaticCode(curColorCode));
+  return areaChanged || colorChanged;
+}
+
+static void beginSettling(const BlobInfo &best, const ColorInfo &ci) {
+  detState = ST_SETTLING;
+  settleStart = millis();
+  settleWarned = false;
+  stableCount = 1;
+  prevBlob = best;
+  resetAccumulators();
+  accumulate(best, ci);
+}
+
+static void markRemoved() {
+  detState = ST_EMPTY;
+  removeStreak = 0;
+  changeCount = 0;
+  if (!ENABLE_DEBUG_MODE) mb.Hreg(REG_PRESENT, 0);
 }
 
 static bool tryConfirm() {
@@ -660,20 +772,14 @@ static bool tryConfirm() {
   return true;
 }
 
-static void updateState(const BlobInfo &best, const ColorInfo &ci) {
+static void updateState(const BlobInfo &best, const ColorInfo &ci, const FootCheck &fc) {
   bool emptyFrame = best.area < MIN_BLOB_AREA / 2;
   emptyStreak = emptyFrame ? min(emptyStreak + 1, 1000000) : 0;
 
   switch (detState) {
     case ST_EMPTY:
       if (best.valid) {
-        detState = ST_SETTLING;
-        settleStart = millis();
-        settleWarned = false;
-        stableCount = 1;
-        prevBlob = best;
-        resetAccumulators();
-        accumulate(best, ci);
+        beginSettling(best, ci);
         LOG("[DBG] 물체 진입: 면적=%d 중심=(%.0f,%.0f)\n", best.area, best.cx, best.cy);
       }
       break;
@@ -704,6 +810,7 @@ static void updateState(const BlobInfo &best, const ColorInfo &ci) {
       if (stableCount >= STABLE_FRAMES && millis() - settleStart >= STABLE_MIN_MS) {
         if (tryConfirm()) {
           detState = ST_CONFIRMED;
+          saveFootprint(best);
           LOG("[DBG] DETECTED color=%d(%s) size=%d(%s) ratio=%.2f RGB=(%d,%d,%d)\n",
               curColorCode, getColorName(curColorCode), curSizeCode, getSizeName(curSizeCode),
               curRatio, curR, curG, curB);
@@ -717,13 +824,37 @@ static void updateState(const BlobInfo &best, const ColorInfo &ci) {
       }
       break;
 
-    case ST_CONFIRMED:
-      if (emptyStreak >= EMPTY_FRAMES) {
-        detState = ST_EMPTY;
-        if (!ENABLE_DEBUG_MODE) mb.Hreg(REG_PRESENT, 0);
-        LOG("[DBG] 물체 제거됨\n");
+    case ST_CONFIRMED: {
+      // (1) 제거: 확정된 자리가 배경으로 돌아왔는가 (다른 곳의 덩어리는 무시)
+      //     손이 물체를 덮고 있는 동안은 그 자리가 전경이라 제거로 보지 않는다
+      bool vacant = emptyFrame || fc.occ < REMOVE_OCC_MAX;
+      removeStreak = vacant ? removeStreak + 1 : 0;
+      if (removeStreak >= REMOVE_FRAMES) {
+        LOG("[DBG] 물체 제거됨 (확정 위치 점유율 %.0f%%, 남은 최대 덩어리 면적=%d)\n", fc.occ * 100, best.area);
+        markRemoved();
+        break;
+      }
+
+      // (2) 교체: 판이 비는 순간 없이 같은 자리에 크기/색이 다른 물체가 안정적으로 놓임
+      if (isDifferentObject(best, ci, fc)) {
+        if (changeCount > 0 && isSameBlob(changePrev, best)) {
+          changeCount++;
+        } else {
+          changeCount = 1;
+          changeStart = millis();
+        }
+        changePrev = best;
+        if (changeCount >= CHANGE_FRAMES && millis() - changeStart >= CHANGE_MIN_MS) {
+          LOG("[DBG] 다른 물체로 교체됨 (면적 %d→%d, 색 %s→%s) → 제거 처리 후 다시 판정\n",
+              confBlob.area, best.area, getColorName(curColorCode), getColorName(ci.code));
+          markRemoved();
+          beginSettling(best, ci);
+        }
+      } else {
+        changeCount = 0;
       }
       break;
+    }
   }
 }
 
@@ -736,7 +867,7 @@ void processFrame(camera_fb_t *fb) {
   const uint8_t *buf = fb->buf;
   frameNo++;
 
-  bool doBgUpdate = detState == ST_EMPTY && emptyStreak >= BG_UPDATE_AFTER && (frameNo % BG_UPDATE_EVERY) == 0;
+  bool doBgUpdate = (frameNo % BG_UPDATE_EVERY) == 0;
 
   // 1단계: 배경 차분 → 원시 전경 마스크
   memset(fgRaw, 0, IMG_N);
@@ -760,10 +891,10 @@ void processFrame(camera_fb_t *fb) {
       if (isFg) {
         fgRaw[i] = 1;
         fgRawCount++;
-      } else if (doBgUpdate) {
-        bgR[i] = br + (r - br) / 8;
-        bgG[i] = bg + (g - bg) / 8;
-        bgB[i] = bb + (b - bb) / 8;
+      } else if (doBgUpdate && dSum <= BG_TRACK_MAX) {
+        bgR[i] = br + bgStep(r - br);
+        bgG[i] = bg + bgStep(g - bg);
+        bgB[i] = bb + bgStep(b - bb);
       }
     }
   }
@@ -805,8 +936,9 @@ void processFrame(camera_fb_t *fb) {
     if (best.valid) classifyBlobColor(buf, count, ci);
   }
 
-  // 5단계: 상태 머신 (안정화 → 확정 → 제거)
-  updateState(best, ci);
+  // 5단계: 확정된 물체 자리 점검 → 상태 머신 (안정화 → 확정 → 제거/교체)
+  lastFoot = detState == ST_CONFIRMED ? checkFootprint(best) : FootCheck();
+  updateState(best, ci, lastFoot);
 
   if (ENABLE_DEBUG_MODE) renderDebug(fb, best, ci, fgRawCount, fgCount, components);
 }
@@ -825,7 +957,7 @@ button{padding:6px 12px;margin:6px 6px 6px 0}a{color:#8cf}
 </style></head><body>
 <h3>ESP32-CAM 큐브 판별 디버그</h3>
 <div>왼쪽: 카메라 + 측정 사각형 (노랑=안정화 중, 초록=확정, 빨강=무효/ROI 경계 접촉)<br>
-오른쪽: 전경 마스크 (픽셀별 색 분류, 하늘색=가장자리 제외, 회색=다른 덩어리, 어두운 점=제거된 노이즈)</div>
+오른쪽: 전경 마스크 (픽셀별 색 분류, 하늘색=가장자리 제외, 회색=다른 덩어리, 진한 빨강=확정 위치 중 비어 보이는 부분, 어두운 점=제거된 노이즈)</div>
 <img id="s">
 <div><button onclick="relearn()">배경 재학습 (판을 비운 뒤 누르세요)</button>
 <a href="/capture" target="_blank">캡처(JPG)</a> · <a href="/raw.bmp" target="_blank">원본(BMP)</a> · <a href="/status" target="_blank">상태(JSON)</a></div>
@@ -842,7 +974,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
 }
 
 static esp_err_t status_handler(httpd_req_t *req) {
-  static char json[1400];
+  static char json[1700];
   DebugStatus st;
   if (xSemaphoreTake(dbgMutex, pdMS_TO_TICKS(200)) != pdTRUE) return httpd_resp_send_500(req);
   st = dbgStatus;
@@ -856,6 +988,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
     "\"len\":%.1f,\"wid\":%.1f,\"ratio\":%.2f,\"angle\":%.0f,\"size\":\"%s\"},"
     "\"color\":{\"code\":%d,\"name\":\"%s\",\"rgb\":[%d,%d,%d],\"samples\":%d,\"chromaShare\":%.2f,\"vRatio\":%.2f,"
     "\"votes\":{\"white\":%d,\"black\":%d,\"red\":%d,\"yellow\":%d,\"green\":%d,\"blue\":%d,\"other\":%d}},"
+    "\"spot\":{\"area\":%d,\"occupancy\":%.2f,\"bestOverlap\":%.2f,\"removeStreak\":%d,\"changeCount\":%d},"
     "\"plate\":{\"rgb\":[%.0f,%.0f,%.0f],\"gray\":%.0f,\"gain\":[%.2f,%.2f,%.2f]},"
     "\"confirmed\":{\"count\":%u,\"color\":%u,\"colorName\":\"%s\",\"size\":%u,\"sizeName\":\"%s\",\"ratio\":%.2f,\"rgb\":[%d,%d,%d]}}",
     STATE_NAMES[st.state], st.fps, (unsigned long)st.frameNo, st.stableCount,
@@ -864,6 +997,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
     b.len, b.wid, b.ratio, b.angleDeg, getSizeName(classifySizeByRatio(b.ratio)),
     c.code, getColorName(c.code), c.r, c.g, c.b, c.samples, c.chromaShare, c.vRatio,
     c.votes[1], c.votes[2], c.votes[3], c.votes[4], c.votes[5], c.votes[6], c.votes[7],
+    st.footArea, st.foot.occ, st.foot.bestOverlap, st.removeStreak, st.changeCount,
     plateR, plateG, plateB, plateGray, gainR, gainG, gainB,
     detectCount, curColorCode, getColorName(curColorCode), curSizeCode, getSizeName(curSizeCode),
     curRatio, curR, curG, curB);
@@ -1019,6 +1153,8 @@ void setup() {
   fgRaw = (uint8_t *)allocBig(IMG_N);
   fgMap = (uint8_t *)allocBig(IMG_N);
   bfsQueue = (uint16_t *)allocBig(IMG_N * sizeof(uint16_t));
+  footMask = (uint8_t *)allocBig(IMG_N);
+  if (footMask) memset(footMask, 0, IMG_N);
   if (ENABLE_DEBUG_MODE) {
     dbgBuf = (uint8_t *)allocBig(DBG_W * DBG_H * 2);
     rawBuf = (uint8_t *)allocBig(IMG_N * 2);
@@ -1027,7 +1163,7 @@ void setup() {
     if (rawBuf) memset(rawBuf, 0, IMG_N * 2);
     if (!dbgBuf || !rawBuf) { dbgBuf = nullptr; LOG("[ERR] 디버그 버퍼 할당 실패\n"); }
   }
-  if (!bgR || !bgG || !bgB || !fgRaw || !fgMap || !bfsQueue) {
+  if (!bgR || !bgG || !bgB || !fgRaw || !fgMap || !bfsQueue || !footMask) {
     LOG("[ERR] 작업 버퍼 할당 실패\n");
     while (true) { delay(1000); }
   }
