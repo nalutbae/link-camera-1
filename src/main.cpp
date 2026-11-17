@@ -16,34 +16,44 @@
 // ==========================================
 //  ENABLE_WEB    true  = Wi-Fi 웹 화면: 영상/마스크, 감지 기록(시스템 로그), Modbus 레지스터 값, 통신·카메라 상태
 //                        → USB 개발보드(ESP32-CAM-MB) 없이 485 운용 중에도 브라우저로 상태 확인
-//  ENABLE_MODBUS true  = UART0(GPIO1/3)로 Modbus RTU 485 통신 (현장 운용: 485 모듈 연결)
-//                false = 같은 UART0로 시리얼 로그 출력 (개발: ESP32-CAM-MB에 꽂아 시리얼 모니터로 볼 때)
-//                ※ true로 올리면 시리얼 모니터에는 부팅 안내 한 줄 외에 아무것도 나오지 않는다 (정상)
+//  ENABLE_MODBUS true  = UART2(GPIO14/15)로 Modbus RTU 485 통신
+//  SERIAL_LOG    true  = UART0(GPIO1/3, USB 개발보드)로 시리얼 로그 115200bps
+//  → 485는 UART2, 로그는 UART0으로 분리되어 있어 셋 다 동시에 켤 수 있다.
+//    485 모듈을 연결한 채로 ESP32-CAM-MB로 업로드·시리얼 모니터 가능.
 #define ENABLE_WEB    true
-#define ENABLE_MODBUS false
-#define SERIAL_LOG    (!ENABLE_MODBUS)   // UART0는 하나뿐이라 Modbus와 시리얼 로그를 동시에 쓸 수 없다
+#define ENABLE_MODBUS true
+#define SERIAL_LOG    true
 
 // ==========================================
 // 2. Wi-Fi 및 Modbus RTU 설정
 // ==========================================
 const char *ssid = "1실습실_2.4G";
 const char *password = "tank5000";
-const char *HOSTNAME = "esp32-cam";     // 시리얼 없이 접속: http://esp32-cam.local (또는 공유기 DHCP 목록에서 IP 확인)
+const char *HOSTNAME = "link-cam1";     // 시리얼 없이 접속: http://link-cam1.local (또는 공유기 DHCP 목록에서 IP 확인)
 
-#define SLAVE_ID        1
+#define SLAVE_ID        6
 #define MODBUS_BAUD     9600
-#define RS485_DE_RE_PIN 13
+// 485 모듈 연결 핀 (UART2). AI-Thinker ESP32-CAM에서 비어 있는 핀 — microSD 카드는 끼우지 말 것 (같은 핀 사용)
+//   GPIO16은 PSRAM, GPIO12는 부팅 전압 설정 핀이라 쓰면 안 된다
+#define MB_SERIAL       Serial2
+#define MB_TX_PIN       14      // ESP32 송신 → 485 모듈
+#define MB_RX_PIN       15      // 485 모듈 → ESP32 수신
+// 485 송수신 방향 제어 핀
+//   -1 : 자동 방향 모듈 (TTL485-V2.0 등 VCC/TXD/RXD/GND 4핀) — 연결할 핀 없음
+//   13 : MAX485처럼 DE/RE 핀이 있는 모듈 — DE와 RE를 묶어 GPIO13에 연결
+#define RS485_DE_RE_PIN -1
 const unsigned long MB_LINK_TIMEOUT_MS = 5000;   // 이 시간 동안 요청이 없으면 '요청 없음'으로 표시
 
 // Modbus 홀딩 레지스터 주소 정의 (0-based, Modbus 40001번지부터)
+//   PLC에서 가장 중요한 색상·크기·물체 유무를 앞쪽(40001~40003)에 둔다
 #define REG_COLOR_CODE  0       // 40001: 색상 코드 (1:흰, 2:검, 3:빨, 4:노, 5:초, 6:파)
-#define REG_R_VAL       1       // 40002: R 값 (판 기준 화이트밸런스 보정 후)
-#define REG_G_VAL       2       // 40003: G 값
-#define REG_B_VAL       3       // 40004: B 값
-#define REG_DETECT_CNT  4       // 40005: 새 물체 감지 누적 횟수
-#define REG_SIZE_CODE   5       // 40006: 크기 코드 (1:소, 2:중, 3:대)
-#define REG_RATIO_X100  6       // 40007: 긴변/짧은변 비율 x 100 (예: 157 = 1.57배)
-#define REG_PRESENT     7       // 40008: 확정된 물체가 판 위에 있음 (0/1)
+#define REG_SIZE_CODE   1       // 40002: 크기 코드 (1:소, 2:중, 3:대)
+#define REG_PRESENT     2       // 40003: 확정된 물체가 판 위에 있음 (0/1)
+#define REG_R_VAL       3       // 40004: R 값 (판 기준 화이트밸런스 보정 후)
+#define REG_G_VAL       4       // 40005: G 값
+#define REG_B_VAL       5       // 40006: B 값
+#define REG_DETECT_CNT  6       // 40007: 새 물체 감지 누적 횟수
+#define REG_RATIO_X100  7       // 40008: 긴변/짧은변 비율 x 100 (예: 157 = 1.57배)
 #define REG_COMMAND     8       // 40009: 명령. PLC가 1을 쓰면 배경 재학습 → 진행 중 2 → 완료 0
 #define REG_COUNT       9
 
@@ -1122,15 +1132,17 @@ const SIZES=['미판별','소(35mm)','중(55mm)','대(85mm)'];
 const STATES={EMPTY:['판 비어 있음',''],SETTLING:['안정화 중','warn'],CONFIRMED:['확정','ok']};
 const PIDS={0x26:'OV2640',0x3660:'OV3660',0x5640:'OV5640',0x77:'OV7725'};
 const FCN={1:'Read Coils',2:'Read Discrete Inputs',3:'Read Holding Registers',4:'Read Input Registers',5:'Write Single Coil',6:'Write Single Register',15:'Write Multiple Coils',16:'Write Multiple Registers',22:'Mask Write Register',23:'Read/Write Multiple Registers'};
+// 펌웨어의 REG_* 순서(40001~)와 같아야 한다
+const REG_PRESENT=2;
 const REGS=[
  ['색상 코드',v=>(COLORS[v]??'?')+' — 1흰 2검 3빨 4노 5초 6파'],
+ ['크기 코드',v=>(SIZES[v]??'?')+' — 1소 2중 3대'],
+ ['물체 있음',v=>v?'1 = 판 위에 있음':'0 = 없음 (제거됨)'],
  ['R 값',v=>'판 기준 화이트밸런스 보정 후 평균'],
  ['G 값',v=>'〃'],
  ['B 값',v=>'〃'],
  ['감지 누적 횟수',v=>'새 물체가 확정될 때마다 +1 (값이 바뀌면 새 데이터)'],
- ['크기 코드',v=>(SIZES[v]??'?')+' — 1소 2중 3대'],
  ['변 비율 ×100',v=>'긴변/짧은변 = '+(v/100).toFixed(2)],
- ['물체 있음',v=>v?'1 = 판 위에 있음':'0 = 없음 (제거됨)'],
  ['명령',v=>({0:'0 = 대기',1:'1 = 배경 재학습 요청',2:'2 = 재학습 진행 중'})[v]??String(v)],
 ];
 const tb=$('regs');
@@ -1155,7 +1167,7 @@ function render(j){
   $('resSub').textContent=`#${c.count} · 색상 ${c.color} · 크기 ${c.size} · RGB(${c.rgb.join(', ')}) · 변 비율 ${c.ratio.toFixed(2)}`;
  }
  const b=j.blob;
- const rows=[['판 위 물체',regs[7]?'<span class="pill ok">있음</span>':(c.count>0?'<span class="pill">없음 — 위 결과는 마지막 감지</span>':'<span class="pill">없음</span>')],
+ const rows=[['판 위 물체',regs[REG_PRESENT]?'<span class="pill ok">있음</span>':(c.count>0?'<span class="pill">없음 — 위 결과는 마지막 감지</span>':'<span class="pill">없음</span>')],
   ['현재 프레임',b.area>0?`덩어리 ${b.area}px · ${b.valid?'유효':'무효'+(b.touchesBorder?'(경계 접촉)':'(작음)')} · 비율 ${b.ratio.toFixed(2)} → ${b.size}`:'변화 없음'],
   ['현재 프레임 색',j.color.samples>0?`${j.color.name} · RGB(${j.color.rgb.join(', ')})`:'-']];
  if(j.state=='SETTLING')rows.push(['안정화',`${j.stable}프레임`]);
@@ -1164,11 +1176,11 @@ function render(j){
  [...tb.rows].forEach((tr,i)=>{const v=regs[i];tr.cells[3].textContent=v;tr.cells[4].textContent='0x'+v.toString(16).toUpperCase().padStart(4,'0');tr.cells[6].textContent=REGS[i][1](v);
   if(prevRegs&&prevRegs[i]!==v){tr.classList.add('flash');setTimeout(()=>tr.classList.remove('flash'),80);}});
  prevRegs=regs.slice();
- pill($('mode'),m.enabled?'운용: Modbus 485 + 웹':'디버그: 시리얼 로그 + 웹',m.enabled?'ok':'warn');
- $('mbCfg').textContent=`슬레이브 ID ${m.slave} · ${m.baud}bps 8N1 · DE/RE GPIO${m.dePin}`;
+ pill($('mode'),m.enabled?'Modbus 485 사용':'Modbus 꺼짐',m.enabled?'ok':'warn');
+ $('mbCfg').textContent=`슬레이브 ID ${m.slave} · ${m.baud}bps 8N1 · TX GPIO${m.txPin} · RX GPIO${m.rxPin} · `+(m.dePin<0?'자동 방향 모듈':`DE/RE GPIO${m.dePin}`);
  let hint='';
  if(!m.enabled){pill($('mbPill'),'통신 꺼짐','warn');
-  kv($('mbKv'),[['Modbus','꺼짐 (ENABLE_MODBUS = false)'],['UART0','시리얼 로그 출력용 (115200bps)']]);
+  kv($('mbKv'),[['Modbus','꺼짐 (ENABLE_MODBUS = false)']]);
   hint='표의 값은 통신을 켰을 때 PLC가 읽게 될 값입니다.';
  }else{
   const live=m.lastAgo>=0&&m.lastAgo<m.linkTimeout;
@@ -1176,7 +1188,7 @@ function render(j){
   const r=[['수신 요청',`${m.requests}회 (정상 ${m.ok} · 오류 응답 ${m.requests-m.ok})`],['마지막 요청',m.requests?ago(m.lastAgo):'없음']];
   if(m.requests){r.push(['함수',`FC${String(m.lastFc).padStart(2,'0')} ${FCN[m.lastFc]||''}`],['대상',regRange(m.lastFc,m.lastAddr,m.lastArg)],['결과',m.lastOk?'<span class="pill ok">정상 응답</span>':'<span class="pill bad">오류 응답</span> 주소 범위/함수 코드 확인']);}
   kv($('mbKv'),r);
-  if(m.requests==0)hint='요청이 한 번도 없으면 485 배선(A/B), 보오율, 슬레이브 ID, DE/RE 핀을 확인하세요. CRC 오류나 다른 ID로 보낸 요청은 집계되지 않습니다.';
+  if(m.requests==0)hint='요청이 한 번도 없으면 TXD/RXD 연결을 서로 바꿔 보고, 485 배선(A/B), 보오율, 슬레이브 ID를 확인하세요. CRC 오류나 다른 ID로 보낸 요청은 집계되지 않습니다.';
   else if(m.requests>m.ok)hint='오류 응답은 없는 주소(40010 이후 등)나 지원하지 않는 함수 코드를 요청했을 때 생깁니다.';
  }
  $('mbHint').textContent=hint;
@@ -1315,9 +1327,9 @@ static esp_err_t status_handler(httpd_req_t *req) {
   uint32_t req_n = mbReqCount;
   unsigned long lastReq = mbLastReqMs;
   n = jsonAppend(json, cap, n,
-    ",\"modbus\":{\"enabled\":%s,\"slave\":%d,\"baud\":%d,\"dePin\":%d,\"linkTimeout\":%lu,"
+    ",\"modbus\":{\"enabled\":%s,\"slave\":%d,\"baud\":%d,\"txPin\":%d,\"rxPin\":%d,\"dePin\":%d,\"linkTimeout\":%lu,"
     "\"requests\":%lu,\"ok\":%lu,\"lastAgo\":%ld,\"lastFc\":%u,\"lastAddr\":%u,\"lastArg\":%u,\"lastOk\":%s,\"regs\":[",
-    ENABLE_MODBUS ? "true" : "false", SLAVE_ID, MODBUS_BAUD, RS485_DE_RE_PIN, MB_LINK_TIMEOUT_MS,
+    ENABLE_MODBUS ? "true" : "false", SLAVE_ID, MODBUS_BAUD, MB_TX_PIN, MB_RX_PIN, RS485_DE_RE_PIN, MB_LINK_TIMEOUT_MS,
     (unsigned long)req_n, (unsigned long)mbOkCount, req_n ? (long)(now - lastReq) : -1L,
     (unsigned)mbLastFc, (unsigned)mbLastAddr, (unsigned)mbLastArg, mbLastOk ? "true" : "false");
   for (int i = 0; i < REG_COUNT; i++) n = jsonAppend(json, cap, n, "%s%u", i ? "," : "", (unsigned)regMirror[i]);
@@ -1533,19 +1545,14 @@ void setup() {
   }
 
   if (ENABLE_MODBUS) {
-    // UART0를 Modbus에 넘기기 전에 115200bps로 안내 한 줄 — 시리얼 모니터가 조용한 이유를 알 수 있게
-    Serial.begin(115200);
-    Serial.printf("\n[Info] Modbus 485 모드 (ENABLE_MODBUS=true): 이후 시리얼 로그 없음. "
-                  "상태는 웹 http://%s.local 에서 확인\n", HOSTNAME);
-    Serial.flush();
-    Serial.end();
-    Serial.begin(MODBUS_BAUD, SERIAL_8N1);
-    mb.begin(&Serial, RS485_DE_RE_PIN);
+    MB_SERIAL.begin(MODBUS_BAUD, SERIAL_8N1, MB_RX_PIN, MB_TX_PIN);
+    mb.begin(&MB_SERIAL, RS485_DE_RE_PIN);
     mb.slave(SLAVE_ID);
     for (int i = 0; i < REG_COUNT; i++) mb.addHreg(i, 0);
     mb.onRequest(onMbRequest);           // 통신 상태(요청 수/마지막 요청) 집계
     mb.onRequestSuccess(onMbSuccess);
-    EVENT("[485] Modbus RTU 시작: 슬레이브 ID %d, %dbps 8N1, 40001~%d", SLAVE_ID, MODBUS_BAUD, 40000 + REG_COUNT);
+    EVENT("[485] Modbus RTU 시작: 슬레이브 ID %d, %dbps 8N1, 40001~%d (UART2 TX=GPIO%d RX=GPIO%d)",
+          SLAVE_ID, MODBUS_BAUD, 40000 + REG_COUNT, MB_TX_PIN, MB_RX_PIN);
   }
 
   // Wi-Fi는 기다리지 않는다 (Modbus 운용 중 Wi-Fi가 없어도 멈추지 않게). 연결되면 networkTask()가 웹 서버를 시작
