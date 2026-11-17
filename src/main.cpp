@@ -56,6 +56,16 @@ volatile bool isStreaming = false;
 
 int curR = 0, curG = 0, curB = 0;
 uint16_t curColorCode = 0;
+uint16_t lastLoggedCode = 0; // 직전에 로그로 출력한 색상 코드 기억용
+
+// Modbus 레지스터 주소 정의에 감지 횟수(카운트) 추가
+#define REG_DETECT_CNT  4       // 40005: 새 물체 감지 누적 횟수 (연속 동일 색상 구분용)
+
+// 상태 추적 변수 추가
+bool isObjectRemoved = true;    // 물체가 치워져 배경(0)을 거쳤는지 여부
+bool hasNewDetection = false;   // 새 물체 감지 이벤트 발생 플래그
+uint16_t detectCount = 0;       // 새 물체 감지 횟수
+
 
 // ==========================================
 // 4. 6가지 색상 판별 함수 (숫자 코드 반환)
@@ -136,14 +146,27 @@ void processFrame(camera_fb_t *fb) {
   curR = sumR / pixelCount;
   curG = sumG / pixelCount;
   curB = sumB / pixelCount;
-  curColorCode = detectCubeColorCode(curR, curG, curB);
+  uint16_t detected = detectCubeColorCode(curR, curG, curB);
 
-  // Modbus 홀딩 레지스터에 최신 측정값 업데이트
-  if (!ENABLE_DEBUG_MODE) {
-    mb.Hreg(REG_COLOR_CODE, curColorCode);
-    mb.Hreg(REG_R_VAL, (uint16_t)curR);
-    mb.Hreg(REG_G_VAL, (uint16_t)curG);
-    mb.Hreg(REG_B_VAL, (uint16_t)curB);
+  if (detected == 0) {
+    // 물체가 치워져 배경 상태가 되면 다음 물체를 받을 준비 완료
+    isObjectRemoved = true;
+  } else {
+    // 배경(0)을 거친 후 새로 들어왔거나, 놓인 상태에서 색상이 바뀐 경우
+    if (isObjectRemoved || (detected != curColorCode)) {
+      curColorCode = detected;
+      isObjectRemoved = false;   // 물체가 올라와 있는 상태로 잠금
+      hasNewDetection = true;    // 로그 출력 트리거 활성화
+      detectCount++;             // 감지 카운트 증가 (PLC가 동일 색상 연속 투입 인지용)
+
+      if (!ENABLE_DEBUG_MODE) {
+        mb.Hreg(REG_COLOR_CODE, curColorCode);
+        mb.Hreg(REG_R_VAL, (uint16_t)curR);
+        mb.Hreg(REG_G_VAL, (uint16_t)curG);
+        mb.Hreg(REG_B_VAL, (uint16_t)curB);
+        mb.Hreg(REG_DETECT_CNT, detectCount);
+      }
+    }
   }
 
   // 디버깅 모드일 때만 웹 스트리밍용 가이드 박스 그리기
@@ -262,6 +285,8 @@ void setup() {
     mb.addHreg(REG_R_VAL, 0);
     mb.addHreg(REG_G_VAL, 0);
     mb.addHreg(REG_B_VAL, 0);
+    mb.addHreg(REG_DETECT_CNT, 0);
+
   }
 }
 
@@ -284,9 +309,14 @@ void loop() {
       esp_camera_fb_return(fb);
     }
 
-    if (ENABLE_DEBUG_MODE) {
-      // Serial.printf("Code:%d | R:%3d G:%3d B:%3d\n", curColorCode, curR, curG, curB);
-      Serial.printf("%d: %s (R:%3d G:%3d B:%3d)\n", curColorCode, getColorName(curColorCode), curR, curG, curB);
+    // if (ENABLE_DEBUG_MODE) {
+    //   // Serial.printf("Code:%d | R:%3d G:%3d B:%3d\n", curColorCode, curR, curG, curB);
+    //   Serial.printf("%d: %s (R:%3d G:%3d B:%3d)\n", curColorCode, getColorName(curColorCode), curR, curG, curB);
+    // }
+
+    if (ENABLE_DEBUG_MODE && hasNewDetection) {
+      Serial.printf("[#%d] %d: %s (R:%3d G:%3d B:%3d)\n", detectCount, curColorCode, getColorName(curColorCode), curR, curG, curB);
+      hasNewDetection = false;
     }
 
     lastScan = millis();
