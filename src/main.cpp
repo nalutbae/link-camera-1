@@ -2,6 +2,8 @@
 #include <Modbus.h>
 #include <ModbusRTU.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
+#include <stdarg.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
@@ -10,21 +12,28 @@
 #include "freertos/semphr.h"
 
 // ==========================================
-// 1. 운용 모드 스위치
+// 1. 운용 모드 스위치 (둘 다 켜도 됨)
 // ==========================================
-//  true  = 웹 디버깅 모드 (Wi-Fi 연결, 브라우저에서 영상/마스크/측정값 확인)
-//  false = Modbus RTU 485 운용 모드 (PLC와 통신)
-#define ENABLE_DEBUG_MODE true
+//  ENABLE_WEB    true  = Wi-Fi 웹 화면: 영상/마스크, 감지 기록(시스템 로그), Modbus 레지스터 값, 통신·카메라 상태
+//                        → USB 개발보드(ESP32-CAM-MB) 없이 485 운용 중에도 브라우저로 상태 확인
+//  ENABLE_MODBUS true  = UART0(GPIO1/3)로 Modbus RTU 485 통신 (현장 운용: 485 모듈 연결)
+//                false = 같은 UART0로 시리얼 로그 출력 (개발: ESP32-CAM-MB에 꽂아 시리얼 모니터로 볼 때)
+//                ※ true로 올리면 시리얼 모니터에는 부팅 안내 한 줄 외에 아무것도 나오지 않는다 (정상)
+#define ENABLE_WEB    true
+#define ENABLE_MODBUS false
+#define SERIAL_LOG    (!ENABLE_MODBUS)   // UART0는 하나뿐이라 Modbus와 시리얼 로그를 동시에 쓸 수 없다
 
 // ==========================================
 // 2. Wi-Fi 및 Modbus RTU 설정
 // ==========================================
 const char *ssid = "1실습실_2.4G";
 const char *password = "tank5000";
+const char *HOSTNAME = "esp32-cam";     // 시리얼 없이 접속: http://esp32-cam.local (또는 공유기 DHCP 목록에서 IP 확인)
 
 #define SLAVE_ID        1
 #define MODBUS_BAUD     9600
 #define RS485_DE_RE_PIN 13
+const unsigned long MB_LINK_TIMEOUT_MS = 5000;   // 이 시간 동안 요청이 없으면 '요청 없음'으로 표시
 
 // Modbus 홀딩 레지스터 주소 정의 (0-based, Modbus 40001번지부터)
 #define REG_COLOR_CODE  0       // 40001: 색상 코드 (1:흰, 2:검, 3:빨, 4:노, 5:초, 6:파)
@@ -36,8 +45,12 @@ const char *password = "tank5000";
 #define REG_RATIO_X100  6       // 40007: 긴변/짧은변 비율 x 100 (예: 157 = 1.57배)
 #define REG_PRESENT     7       // 40008: 확정된 물체가 판 위에 있음 (0/1)
 #define REG_COMMAND     8       // 40009: 명령. PLC가 1을 쓰면 배경 재학습 → 진행 중 2 → 완료 0
+#define REG_COUNT       9
 
-#define LOG(...) do { if (ENABLE_DEBUG_MODE) Serial.printf(__VA_ARGS__); } while (0)
+// LOG   : 매 프레임 상세 로그 — 시리얼 전용
+// EVENT : 감지/제거/통신 등 주요 이벤트 — 시리얼 + 웹 '감지 기록'
+#define LOG(...) do { if (SERIAL_LOG) Serial.printf(__VA_ARGS__); } while (0)
+#define EVENT(...) logEvent(__VA_ARGS__)
 
 // ==========================================
 // 3. 영상 / 관심영역(ROI)
@@ -217,11 +230,41 @@ uint16_t curColorCode = 0;
 uint16_t curSizeCode = 0;
 float curRatio = 0.0f;
 uint16_t detectCount = 0;
-bool hasNewDetection = false;
 
 uint32_t frameNo = 0;
 float fps = 0;
 volatile bool relearnRequested = false;
+
+// 카메라 상태
+bool cameraOk = false;
+uint16_t camPid = 0;
+volatile uint32_t camFails = 0;          // esp_camera_fb_get() 실패 누적
+volatile unsigned long lastFrameMs = 0;  // 마지막으로 프레임을 받은 시각
+
+// Modbus 레지스터 사본 — 웹 화면 표시용 (Modbus를 끈 상태에서도 '제공될 값'을 보여준다)
+volatile uint16_t regMirror[REG_COUNT] = {0};
+
+// Modbus 통신 통계 (이 장치 ID로 온, CRC가 정상인 요청만 집계됨)
+volatile uint32_t mbReqCount = 0;        // 수신한 요청
+volatile uint32_t mbOkCount = 0;         // 정상 응답
+volatile unsigned long mbLastReqMs = 0;
+volatile uint8_t  mbLastFc = 0;
+volatile uint16_t mbLastAddr = 0, mbLastArg = 0;  // 시작 주소(0-based), 개수(FC06이면 쓴 값)
+volatile bool     mbLastOk = false;
+
+// 웹 '감지 기록' 링버퍼
+#define EVT_MAX 40
+#define EVT_LEN 192
+struct EventLine {
+  uint32_t seq;
+  uint32_t ms;
+  char text[EVT_LEN];
+};
+EventLine evtBuf[EVT_MAX];
+volatile uint32_t evtSeq = 0;            // 지금까지 기록된 이벤트 수 (= 마지막 seq)
+SemaphoreHandle_t evtMutex = nullptr;
+
+bool webStarted = false;
 
 // 디버그 화면: 왼쪽 카메라+측정 / 오른쪽 전경 마스크 (320x120 RGB565)
 #define DBG_W (IMG_W * 2)
@@ -274,11 +317,58 @@ static void *allocBig(size_t n) {
   return p;
 }
 
+// 주요 이벤트: 시리얼(가능할 때) + 웹 '감지 기록'
+static void logEvent(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void logEvent(const char *fmt, ...) {
+  char line[EVT_LEN];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(line, sizeof(line), fmt, ap);
+  va_end(ap);
+  if (SERIAL_LOG) Serial.println(line);
+  if (!ENABLE_WEB || !evtMutex) return;
+  if (xSemaphoreTake(evtMutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  EventLine &e = evtBuf[evtSeq % EVT_MAX];
+  e.seq = evtSeq + 1;
+  e.ms = millis();
+  memcpy(e.text, line, sizeof(line));
+  evtSeq = e.seq;
+  xSemaphoreGive(evtMutex);
+}
+
+// Modbus 홀딩 레지스터 쓰기 (웹 표시용 사본도 함께 갱신)
+static void setReg(uint16_t addr, uint16_t val) {
+  if (addr >= REG_COUNT) return;
+  regMirror[addr] = val;
+  if (ENABLE_MODBUS) mb.Hreg(addr, val);
+}
+
+static inline void mbTask() {
+  if (ENABLE_MODBUS) mb.task();
+}
+
+// Modbus 요청 콜백 (mb.task() 안에서 호출됨) — 통신 상태 표시용
+static Modbus::ResultCode onMbRequest(Modbus::FunctionCode fc, const Modbus::RequestData data) {
+  mbReqCount = mbReqCount + 1;
+  mbLastReqMs = millis();
+  mbLastFc = fc;
+  mbLastAddr = data.reg.address;
+  mbLastArg = data.regCount;
+  mbLastOk = false;            // 정상 처리되면 onMbSuccess에서 true
+  return Modbus::EX_SUCCESS;
+}
+
+static Modbus::ResultCode onMbSuccess(Modbus::FunctionCode fc, const Modbus::RequestData data) {
+  mbOkCount = mbOkCount + 1;
+  mbLastOk = true;
+  return Modbus::EX_SUCCESS;
+}
+
 // Modbus 모드에서는 대기 중에도 PLC 요청에 응답
 static void serviceDelay(unsigned long ms) {
   unsigned long t0 = millis();
   do {
-    if (!ENABLE_DEBUG_MODE) mb.task();
+    mbTask();
     delay(2);
   } while (millis() - t0 < ms);
 }
@@ -287,7 +377,7 @@ static void flushFrames(int n) {
   for (int i = 0; i < n; i++) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
-    if (!ENABLE_DEBUG_MODE) mb.task();
+    mbTask();
   }
 }
 
@@ -382,7 +472,7 @@ void resetDetectionState() {
   removeStreak = 0;
   changeCount = 0;
   lastFoot = FootCheck();
-  if (!ENABLE_DEBUG_MODE) mb.Hreg(REG_PRESENT, 0);
+  setReg(REG_PRESENT, 0);
 }
 
 void learnBackground(bool readapt) {
@@ -409,7 +499,7 @@ void learnBackground(bool readapt) {
 
   uint16_t *acc = (uint16_t *)allocBig(IMG_N * 3 * sizeof(uint16_t));
   if (!acc) {
-    LOG("[BG] 메모리 부족 — 배경 학습 실패\n");
+    EVENT("[BG] 메모리 부족 — 배경 학습 실패");
     return;
   }
   memset(acc, 0, IMG_N * 3 * sizeof(uint16_t));
@@ -426,7 +516,7 @@ void learnBackground(bool readapt) {
       got++;
     }
     esp_camera_fb_return(fb);
-    if (!ENABLE_DEBUG_MODE) mb.task();
+    mbTask();
   }
   if (got > 0) {
     for (int i = 0; i < IMG_N; i++) {
@@ -440,8 +530,12 @@ void learnBackground(bool readapt) {
   free(acc);
   resetDetectionState();
 
-  LOG("[BG] 배경 학습 완료 (%d프레임 평균). 판 평균 RGB=(%.0f,%.0f,%.0f) 게인 R%.2f G%.2f B%.2f\n",
-      got, plateR, plateG, plateB, gainR, gainG, gainB);
+  if (got > 0) {
+    EVENT("[BG] 배경 학습 완료 (%d프레임 평균) 판 RGB=(%.0f,%.0f,%.0f) 게인 R%.2f G%.2f B%.2f",
+          got, plateR, plateG, plateB, gainR, gainG, gainB);
+  } else {
+    EVENT("[BG] 배경 학습 실패 — 카메라 프레임을 받지 못함");
+  }
 }
 
 // ==========================================
@@ -738,7 +832,7 @@ static void markRemoved() {
   detState = ST_EMPTY;
   removeStreak = 0;
   changeCount = 0;
-  if (!ENABLE_DEBUG_MODE) mb.Hreg(REG_PRESENT, 0);
+  setReg(REG_PRESENT, 0);
 }
 
 static bool tryConfirm() {
@@ -757,18 +851,15 @@ static bool tryConfirm() {
   curG = accRgb[best][1] / accRgbN[best];
   curB = accRgb[best][2] / accRgbN[best];
   detectCount++;
-  hasNewDetection = true;
 
-  if (!ENABLE_DEBUG_MODE) {
-    mb.Hreg(REG_COLOR_CODE, curColorCode);
-    mb.Hreg(REG_R_VAL, (uint16_t)curR);
-    mb.Hreg(REG_G_VAL, (uint16_t)curG);
-    mb.Hreg(REG_B_VAL, (uint16_t)curB);
-    mb.Hreg(REG_DETECT_CNT, detectCount);
-    mb.Hreg(REG_SIZE_CODE, curSizeCode);
-    mb.Hreg(REG_RATIO_X100, (uint16_t)(curRatio * 100));
-    mb.Hreg(REG_PRESENT, 1);
-  }
+  setReg(REG_COLOR_CODE, curColorCode);
+  setReg(REG_R_VAL, (uint16_t)curR);
+  setReg(REG_G_VAL, (uint16_t)curG);
+  setReg(REG_B_VAL, (uint16_t)curB);
+  setReg(REG_DETECT_CNT, detectCount);
+  setReg(REG_SIZE_CODE, curSizeCode);
+  setReg(REG_RATIO_X100, (uint16_t)lroundf(curRatio * 100));
+  setReg(REG_PRESENT, 1);
   return true;
 }
 
@@ -811,12 +902,12 @@ static void updateState(const BlobInfo &best, const ColorInfo &ci, const FootChe
         if (tryConfirm()) {
           detState = ST_CONFIRMED;
           saveFootprint(best);
-          LOG("[DBG] DETECTED color=%d(%s) size=%d(%s) ratio=%.2f RGB=(%d,%d,%d)\n",
-              curColorCode, getColorName(curColorCode), curSizeCode, getSizeName(curSizeCode),
-              curRatio, curR, curG, curB);
+          EVENT("[#%u] 색상 %u:%s (R:%d G:%d B:%d) | 크기 %u:%s (변 비율: %.2f)",
+                detectCount, curColorCode, getColorName(curColorCode), curR, curG, curB,
+                curSizeCode, getSizeName(curSizeCode), curRatio);
         } else {
           if (!settleWarned) {
-            LOG("[DBG] 색상 판정 불가 (보라/분홍 계열?) — 계속 관찰\n");
+            EVENT("색상 판정 불가 (보라/분홍 계열?) — 계속 관찰");
             settleWarned = true;
           }
           stableCount = 0;
@@ -830,7 +921,7 @@ static void updateState(const BlobInfo &best, const ColorInfo &ci, const FootChe
       bool vacant = emptyFrame || fc.occ < REMOVE_OCC_MAX;
       removeStreak = vacant ? removeStreak + 1 : 0;
       if (removeStreak >= REMOVE_FRAMES) {
-        LOG("[DBG] 물체 제거됨 (확정 위치 점유율 %.0f%%, 남은 최대 덩어리 면적=%d)\n", fc.occ * 100, best.area);
+        EVENT("물체 제거됨 (확정 위치 점유율 %.0f%%, 남은 최대 덩어리 면적=%d)", fc.occ * 100, best.area);
         markRemoved();
         break;
       }
@@ -845,8 +936,8 @@ static void updateState(const BlobInfo &best, const ColorInfo &ci, const FootChe
         }
         changePrev = best;
         if (changeCount >= CHANGE_FRAMES && millis() - changeStart >= CHANGE_MIN_MS) {
-          LOG("[DBG] 다른 물체로 교체됨 (면적 %d→%d, 색 %s→%s) → 제거 처리 후 다시 판정\n",
-              confBlob.area, best.area, getColorName(curColorCode), getColorName(ci.code));
+          EVENT("다른 물체로 교체됨 (면적 %d→%d, 색 %s→%s) → 제거 처리 후 다시 판정",
+                confBlob.area, best.area, getColorName(curColorCode), getColorName(ci.code));
           markRemoved();
           beginSettling(best, ci);
         }
@@ -940,32 +1031,194 @@ void processFrame(camera_fb_t *fb) {
   lastFoot = detState == ST_CONFIRMED ? checkFootprint(best) : FootCheck();
   updateState(best, ci, lastFoot);
 
-  if (ENABLE_DEBUG_MODE) renderDebug(fb, best, ci, fgRawCount, fgCount, components);
+  if (ENABLE_WEB) renderDebug(fb, best, ci, fgRawCount, fgCount, components);
 }
 
 // ==========================================
 // 16. 웹 디버그 서버 (포트 80: 페이지/상태/캡처, 포트 81: 스트림)
 // ==========================================
 static const char INDEX_HTML[] = R"rawliteral(<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32-CAM 큐브 판별</title>
 <style>
-body{font-family:sans-serif;background:#111;color:#eee;margin:12px}
-img{width:100%;max-width:960px;image-rendering:pixelated;border:1px solid #444}
-pre{background:#222;padding:8px;font-size:13px;white-space:pre-wrap}
-button{padding:6px 12px;margin:6px 6px 6px 0}a{color:#8cf}
+:root{--bg:#111316;--card:#1b1e23;--line:#2d3138;--fg:#e8eaed;--mute:#9aa0a6;--ok:#3ecf6e;--warn:#f5b83d;--bad:#ff6b6b;--acc:#7cb8ff}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.45 system-ui,"Segoe UI","Malgun Gothic",sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line)}
+h1{font-size:17px;margin:0;margin-right:auto}
+h2{font-size:13px;margin:0 0 10px;color:var(--mute);font-weight:600;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+main{display:grid;gap:12px;padding:12px 16px;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));max-width:1400px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;min-width:0}
+.wide{grid-column:1/-1}
+img{width:100%;max-width:960px;aspect-ratio:8/3;image-rendering:pixelated;border-radius:6px;background:#000;display:block}
+.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;background:#30343b;color:var(--fg)}
+.pill.ok{background:#16351f;color:var(--ok)}.pill.warn{background:#3b2f14;color:var(--warn)}.pill.bad{background:#3d1b1b;color:var(--bad)}
+.result{display:flex;gap:14px;align-items:center;margin-bottom:12px}
+.swatch{width:60px;height:60px;border-radius:10px;border:1px solid #555;flex:none;background:repeating-linear-gradient(45deg,#2a2d33 0 6px,#22252a 6px 12px)}
+.big{font-size:22px;font-weight:700}
+.sub{color:var(--mute);font-size:13px}
+dl.kv{display:grid;grid-template-columns:max-content 1fr;gap:5px 14px;margin:0}
+dl.kv dt{color:var(--mute)}dl.kv dd{margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+pre{margin:0;background:#0b0c0e;border-radius:6px;padding:8px 10px;font:12.5px/1.55 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+#log{height:320px;overflow:auto}
+.tbl{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;white-space:nowrap}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--mute);font-weight:600;font-size:12px}
+td.v{font:700 14px ui-monospace,Consolas,monospace;text-align:right}
+td.h{color:var(--mute);font:12px ui-monospace,Consolas,monospace}
+tr td{transition:background 1.5s}tr.flash td{transition:none;background:#2c4220}
+@media(max-width:600px){.hx{display:none}main{padding:12px}}
+.note{color:var(--mute);font-size:12px;margin:8px 0 0}
+button{background:#2b3440;color:var(--fg);border:1px solid #3c4756;border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit}
+button:hover{background:#344050}
+a{color:var(--acc)}
+.row{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin-top:10px}
+.legend{color:var(--mute);font-size:12px;margin-top:8px}
+summary{cursor:pointer;color:var(--mute);font-weight:600;font-size:13px}
+details[open] summary{margin-bottom:10px}
 </style></head><body>
-<h3>ESP32-CAM 큐브 판별 디버그</h3>
-<div>왼쪽: 카메라 + 측정 사각형 (노랑=안정화 중, 초록=확정, 빨강=무효/ROI 경계 접촉)<br>
-오른쪽: 전경 마스크 (픽셀별 색 분류, 하늘색=가장자리 제외, 회색=다른 덩어리, 진한 빨강=확정 위치 중 비어 보이는 부분, 어두운 점=제거된 노이즈)</div>
-<img id="s">
-<div><button onclick="relearn()">배경 재학습 (판을 비운 뒤 누르세요)</button>
-<a href="/capture" target="_blank">캡처(JPG)</a> · <a href="/raw.bmp" target="_blank">원본(BMP)</a> · <a href="/status" target="_blank">상태(JSON)</a></div>
-<pre id="st"></pre>
+<header><h1>ESP32-CAM 큐브 판별</h1><span id="mode" class="pill"></span><span id="conn" class="pill">연결 중…</span></header>
+<main>
+<section class="card wide">
+ <h2>카메라 영상 <span class="sub">왼쪽: 카메라 + 측정 · 오른쪽: 전경 마스크</span></h2>
+ <img id="s" alt="카메라 스트림">
+ <div class="legend">사각형 — 노랑: 안정화 중, 초록: 확정, 빨강: 무효(ROI 경계 접촉). 마스크 — 픽셀별 색 분류, 하늘색: 가장자리(판정 제외), 회색: 다른 덩어리, 진한 빨강: 확정 위치 중 비어 보이는 부분, 어두운 점: 제거된 노이즈</div>
+ <div class="row"><button onclick="relearn()">배경 재학습</button>
+ <a href="/capture" target="_blank">캡처(JPG)</a><a href="/raw.bmp" target="_blank">원본(BMP)</a><a href="/status" target="_blank">상태(JSON)</a></div>
+</section>
+<section class="card">
+ <h2>감지된 물체 <span id="state" class="pill"></span></h2>
+ <div class="result"><div id="sw" class="swatch"></div><div><div id="res" class="big">아직 감지 없음</div><div id="resSub" class="sub"></div></div></div>
+ <dl class="kv" id="nowKv"></dl>
+</section>
+<section class="card">
+ <h2>감지 기록 <span class="sub">시스템 로그 · 최근 이벤트</span></h2>
+ <pre id="log"></pre>
+</section>
+<section class="card wide">
+ <h2>Modbus RTU 홀딩 레지스터 <span id="mbPill" class="pill"></span><span id="mbCfg" class="sub"></span></h2>
+ <div class="tbl"><table>
+ <thead><tr><th>주소</th><th>오프셋</th><th>항목</th><th style="text-align:right">값</th><th class="hx">HEX</th><th>접근</th><th>의미</th></tr></thead>
+ <tbody id="regs"></tbody></table></div>
+ <p class="note" id="mbNote">FC03(Read Holding Registers)로 40001부터 9개를 한 번에 읽으면 됩니다. 오프셋은 0부터 세는 주소입니다(PLC 설정에 따라 사용). 40009에 1을 쓰면(FC06) 배경을 다시 학습합니다 → 진행 중 2 → 완료 0.</p>
+</section>
+<section class="card">
+ <h2>통신 상태</h2>
+ <dl class="kv" id="mbKv"></dl>
+ <p class="note" id="mbHint"></p>
+</section>
+<section class="card">
+ <h2>카메라 · 시스템</h2>
+ <dl class="kv" id="sysKv"></dl>
+</section>
+<details class="card wide" id="det"><summary>상세 측정값 (JSON)</summary><pre id="st"></pre></details>
+</main>
 <script>
-document.getElementById('s').src='http://'+location.hostname+':81/stream';
-function relearn(){fetch('/relearn').then(r=>r.text()).then(t=>alert(t));}
-setInterval(()=>fetch('/status').then(r=>r.json()).then(j=>{document.getElementById('st').textContent=JSON.stringify(j,null,1)}).catch(()=>{}),700);
+const $=id=>document.getElementById(id);
+const COLORS=['미감지','흰색','검정색','빨간색','노란색','초록색','파란색'];
+const SW=['','#f2f2f2','#161616','#e53935','#fdd835','#43a047','#1e88e5'];
+const SIZES=['미판별','소(35mm)','중(55mm)','대(85mm)'];
+const STATES={EMPTY:['판 비어 있음',''],SETTLING:['안정화 중','warn'],CONFIRMED:['확정','ok']};
+const PIDS={0x26:'OV2640',0x3660:'OV3660',0x5640:'OV5640',0x77:'OV7725'};
+const FCN={1:'Read Coils',2:'Read Discrete Inputs',3:'Read Holding Registers',4:'Read Input Registers',5:'Write Single Coil',6:'Write Single Register',15:'Write Multiple Coils',16:'Write Multiple Registers',22:'Mask Write Register',23:'Read/Write Multiple Registers'};
+const REGS=[
+ ['색상 코드',v=>(COLORS[v]??'?')+' — 1흰 2검 3빨 4노 5초 6파'],
+ ['R 값',v=>'판 기준 화이트밸런스 보정 후 평균'],
+ ['G 값',v=>'〃'],
+ ['B 값',v=>'〃'],
+ ['감지 누적 횟수',v=>'새 물체가 확정될 때마다 +1 (값이 바뀌면 새 데이터)'],
+ ['크기 코드',v=>(SIZES[v]??'?')+' — 1소 2중 3대'],
+ ['변 비율 ×100',v=>'긴변/짧은변 = '+(v/100).toFixed(2)],
+ ['물체 있음',v=>v?'1 = 판 위에 있음':'0 = 없음 (제거됨)'],
+ ['명령',v=>({0:'0 = 대기',1:'1 = 배경 재학습 요청',2:'2 = 재학습 진행 중'})[v]??String(v)],
+];
+const tb=$('regs');
+REGS.forEach((r,i)=>{const tr=document.createElement('tr');
+ tr.innerHTML=`<td>${40001+i}</td><td>${i}</td><td>${r[0]}</td><td class="v">-</td><td class="h hx">-</td><td>${i==8?'읽기/쓰기':'읽기'}</td><td class="m"></td>`;tb.appendChild(tr);});
+let prevRegs=null,lastOk=0;
+const pill=(el,t,c)=>{el.textContent=t;el.className='pill '+(c||'');};
+const kv=(el,rows)=>{el.innerHTML=rows.map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join('');};
+function ago(ms){if(ms<0)return '없음';if(ms<1000)return ms+'ms 전';if(ms<60000)return (ms/1000).toFixed(1)+'초 전';return Math.floor(ms/60000)+'분 '+Math.floor(ms%60000/1000)+'초 전';}
+function upt(ms){const s=Math.floor(ms/1000);return Math.floor(s/3600)+'시간 '+Math.floor(s%3600/60)+'분 '+s%60+'초';}
+function regRange(fc,a,n){
+ if(fc==6)return `${40001+a} ← ${n}`;
+ if(fc==3||fc==16||fc==23)return n>1?`${40001+a}~${40000+a+n} (${n}개)`:`${40001+a}`;
+ if(fc==4)return n>1?`${30001+a}~${30000+a+n} (${n}개) — 입력 레지스터는 없음`:`${30001+a} — 입력 레지스터는 없음`;
+ return `주소 ${a}, ${n}`;}
+function render(j){
+ const c=j.confirmed,m=j.modbus,regs=m.regs,st=STATES[j.state]||[j.state,''];
+ pill($('state'),st[0],st[1]);
+ if(c.count>0){
+  $('sw').style.background=SW[c.color]||'';
+  $('res').textContent=`${c.colorName} · ${c.sizeName}`;
+  $('resSub').textContent=`#${c.count} · 색상 ${c.color} · 크기 ${c.size} · RGB(${c.rgb.join(', ')}) · 변 비율 ${c.ratio.toFixed(2)}`;
+ }
+ const b=j.blob;
+ const rows=[['판 위 물체',regs[7]?'<span class="pill ok">있음</span>':(c.count>0?'<span class="pill">없음 — 위 결과는 마지막 감지</span>':'<span class="pill">없음</span>')],
+  ['현재 프레임',b.area>0?`덩어리 ${b.area}px · ${b.valid?'유효':'무효'+(b.touchesBorder?'(경계 접촉)':'(작음)')} · 비율 ${b.ratio.toFixed(2)} → ${b.size}`:'변화 없음'],
+  ['현재 프레임 색',j.color.samples>0?`${j.color.name} · RGB(${j.color.rgb.join(', ')})`:'-']];
+ if(j.state=='SETTLING')rows.push(['안정화',`${j.stable}프레임`]);
+ if(j.state=='CONFIRMED')rows.push(['확정 위치 점유율',`${Math.round(j.spot.occupancy*100)}% (35% 미만이 이어지면 제거로 판정)`]);
+ kv($('nowKv'),rows);
+ [...tb.rows].forEach((tr,i)=>{const v=regs[i];tr.cells[3].textContent=v;tr.cells[4].textContent='0x'+v.toString(16).toUpperCase().padStart(4,'0');tr.cells[6].textContent=REGS[i][1](v);
+  if(prevRegs&&prevRegs[i]!==v){tr.classList.add('flash');setTimeout(()=>tr.classList.remove('flash'),80);}});
+ prevRegs=regs.slice();
+ pill($('mode'),m.enabled?'운용: Modbus 485 + 웹':'디버그: 시리얼 로그 + 웹',m.enabled?'ok':'warn');
+ $('mbCfg').textContent=`슬레이브 ID ${m.slave} · ${m.baud}bps 8N1 · DE/RE GPIO${m.dePin}`;
+ let hint='';
+ if(!m.enabled){pill($('mbPill'),'통신 꺼짐','warn');
+  kv($('mbKv'),[['Modbus','꺼짐 (ENABLE_MODBUS = false)'],['UART0','시리얼 로그 출력용 (115200bps)']]);
+  hint='표의 값은 통신을 켰을 때 PLC가 읽게 될 값입니다.';
+ }else{
+  const live=m.lastAgo>=0&&m.lastAgo<m.linkTimeout;
+  pill($('mbPill'),m.requests==0?'요청 없음':(live?'통신 중':'요청 끊김'),m.requests==0?'warn':(live?'ok':'bad'));
+  const r=[['수신 요청',`${m.requests}회 (정상 ${m.ok} · 오류 응답 ${m.requests-m.ok})`],['마지막 요청',m.requests?ago(m.lastAgo):'없음']];
+  if(m.requests){r.push(['함수',`FC${String(m.lastFc).padStart(2,'0')} ${FCN[m.lastFc]||''}`],['대상',regRange(m.lastFc,m.lastAddr,m.lastArg)],['결과',m.lastOk?'<span class="pill ok">정상 응답</span>':'<span class="pill bad">오류 응답</span> 주소 범위/함수 코드 확인']);}
+  kv($('mbKv'),r);
+  if(m.requests==0)hint='요청이 한 번도 없으면 485 배선(A/B), 보오율, 슬레이브 ID, DE/RE 핀을 확인하세요. CRC 오류나 다른 ID로 보낸 요청은 집계되지 않습니다.';
+  else if(m.requests>m.ok)hint='오류 응답은 없는 주소(40010 이후 등)나 지원하지 않는 함수 코드를 요청했을 때 생깁니다.';
+ }
+ $('mbHint').textContent=hint;
+ const cam=j.camera,w=j.wifi;
+ kv($('sysKv'),[
+  ['카메라',cam.ok?`<span class="pill ok">정상</span> ${PIDS[cam.pid]||''} (PID 0x${cam.pid.toString(16).toUpperCase()})`:'<span class="pill bad">초기화 실패</span> 배선/전원 확인 후 재부팅'],
+  ['처리 속도',`${j.fps.toFixed(1)} fps · 처리 ${j.frame}프레임`],
+  ['프레임 수신',`마지막 ${ago(cam.lastFrameAgo)} · 실패 누적 ${cam.fails}회`],
+  ['Wi-Fi',`${w.ssid} · ${w.ip} · ${w.rssi} dBm`],
+  ['주소',`http://${w.host}.local`],
+  ['가동 시간',upt(j.uptime)],
+  ['여유 메모리',`내부 ${(j.heap/1024).toFixed(0)}KB · PSRAM ${(j.psram/1024).toFixed(0)}KB`],
+  ['판(배경)',`RGB(${j.plate.rgb.join(', ')}) · 게인 ${j.plate.gain.join(' / ')}`]]);
+ if($('det').open)$('st').textContent=JSON.stringify(j,null,1);
+}
+async function pollStatus(){
+ try{const j=await(await fetch('/status',{cache:'no-store'})).json();lastOk=Date.now();render(j);}catch(e){}
+ if(Date.now()-lastOk>3000)pill($('conn'),'장치 응답 없음','bad');else pill($('conn'),'연결됨','ok');
+ setTimeout(pollStatus,700);
+}
+let since=0,prevUp=0;const logLines=[];
+const hms=d=>[d.getHours(),d.getMinutes(),d.getSeconds()].map(x=>String(x).padStart(2,'0')).join(':');
+function addLog(s){logLines.push(s);if(logLines.length>300)logLines.shift();}
+async function pollLog(){
+ try{
+  const t=await(await fetch('/events?since='+since,{cache:'no-store'})).text();
+  const rows=t.split('\n'),h=rows.shift().split('\t'),now=+h[1],last=+h[2];
+  if(now<prevUp||last<since){addLog('--- 장치가 재시작됨 ---');since=0;}
+  prevUp=now;
+  for(const r of rows){if(!r)continue;const a=r.indexOf('\t'),b=r.indexOf('\t',a+1);
+   const seq=+r.slice(0,a),ms=+r.slice(a+1,b),txt=r.slice(b+1);
+   if(seq<=since)continue;
+   if(since&&seq>since+1)addLog(`… (${seq-since-1}줄 지나감)`);
+   addLog(hms(new Date(Date.now()-(now-ms)))+'  '+txt);since=seq;}
+  const el=$('log'),bottom=el.scrollTop+el.clientHeight>=el.scrollHeight-20;
+  el.textContent=logLines.join('\n');if(bottom)el.scrollTop=el.scrollHeight;
+ }catch(e){}
+ setTimeout(pollLog,1000);
+}
+function relearn(){if(!confirm('판 위의 물체를 모두 치웠나요? 배경을 다시 학습합니다.'))return;fetch('/relearn').then(r=>r.text()).then(t=>alert(t));}
+$('s').src='http://'+location.hostname+':81/stream';
+pollStatus();pollLog();
 </script></body></html>)rawliteral";
 
 static esp_err_t index_handler(httpd_req_t *req) {
@@ -973,15 +1226,59 @@ static esp_err_t index_handler(httpd_req_t *req) {
   return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
+// 감지 기록: 첫 줄 "now\t<가동ms>\t<마지막 seq>", 이후 "seq\t<기록ms>\t<내용>" (since 이후만)
+static esp_err_t events_handler(httpd_req_t *req) {
+  uint32_t since = 0;
+  char q[48], v[16];
+  if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+      httpd_query_key_value(q, "since", v, sizeof(v)) == ESP_OK) {
+    since = strtoul(v, nullptr, 10);
+  }
+  httpd_resp_set_type(req, "text/plain; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  uint32_t last = evtSeq;
+  char line[EVT_LEN + 32];
+  int n = snprintf(line, sizeof(line), "now\t%lu\t%lu\n", (unsigned long)millis(), (unsigned long)last);
+  if (httpd_resp_send_chunk(req, line, n) != ESP_OK) return ESP_FAIL;
+
+  uint32_t first = last > EVT_MAX ? last - EVT_MAX + 1 : 1;
+  if (since + 1 > first) first = since + 1;
+  for (uint32_t s = first; s <= last; s++) {
+    EventLine e;
+    bool ok = false;
+    if (xSemaphoreTake(evtMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      e = evtBuf[(s - 1) % EVT_MAX];
+      ok = e.seq == s;          // 읽는 사이 덮어써졌으면 건너뜀
+      xSemaphoreGive(evtMutex);
+    }
+    if (!ok) continue;
+    n = snprintf(line, sizeof(line), "%lu\t%lu\t%s\n", (unsigned long)e.seq, (unsigned long)e.ms, e.text);
+    if (httpd_resp_send_chunk(req, line, n) != ESP_OK) return ESP_FAIL;
+  }
+  return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+static size_t jsonAppend(char *buf, size_t cap, size_t n, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static size_t jsonAppend(char *buf, size_t cap, size_t n, const char *fmt, ...) {
+  if (n >= cap) return n;
+  va_list ap;
+  va_start(ap, fmt);
+  int w = vsnprintf(buf + n, cap - n, fmt, ap);
+  va_end(ap);
+  return w < 0 ? cap : n + w;   // cap 이상이면 잘림 → 호출자가 500 처리
+}
+
 static esp_err_t status_handler(httpd_req_t *req) {
-  static char json[1700];
+  static char json[3072];
+  const size_t cap = sizeof(json);
   DebugStatus st;
   if (xSemaphoreTake(dbgMutex, pdMS_TO_TICKS(200)) != pdTRUE) return httpd_resp_send_500(req);
   st = dbgStatus;
   xSemaphoreGive(dbgMutex);
   const BlobInfo &b = st.blob;
   const ColorInfo &c = st.color;
-  snprintf(json, sizeof(json),
+  size_t n = jsonAppend(json, cap, 0,
     "{\"state\":\"%s\",\"fps\":%.1f,\"frame\":%lu,\"stable\":%d,"
     "\"fgRaw\":%d,\"fg\":%d,\"components\":%d,"
     "\"blob\":{\"area\":%d,\"valid\":%s,\"touchesBorder\":%s,\"cx\":%.1f,\"cy\":%.1f,"
@@ -990,7 +1287,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
     "\"votes\":{\"white\":%d,\"black\":%d,\"red\":%d,\"yellow\":%d,\"green\":%d,\"blue\":%d,\"other\":%d}},"
     "\"spot\":{\"area\":%d,\"occupancy\":%.2f,\"bestOverlap\":%.2f,\"removeStreak\":%d,\"changeCount\":%d},"
     "\"plate\":{\"rgb\":[%.0f,%.0f,%.0f],\"gray\":%.0f,\"gain\":[%.2f,%.2f,%.2f]},"
-    "\"confirmed\":{\"count\":%u,\"color\":%u,\"colorName\":\"%s\",\"size\":%u,\"sizeName\":\"%s\",\"ratio\":%.2f,\"rgb\":[%d,%d,%d]}}",
+    "\"confirmed\":{\"count\":%u,\"color\":%u,\"colorName\":\"%s\",\"size\":%u,\"sizeName\":\"%s\",\"ratio\":%.2f,\"rgb\":[%d,%d,%d]}",
     STATE_NAMES[st.state], st.fps, (unsigned long)st.frameNo, st.stableCount,
     st.fgRawCount, st.fgCount, st.components,
     b.area, b.valid ? "true" : "false", b.touchesBorder ? "true" : "false", b.cx, b.cy,
@@ -1001,6 +1298,32 @@ static esp_err_t status_handler(httpd_req_t *req) {
     plateR, plateG, plateB, plateGray, gainR, gainG, gainB,
     detectCount, curColorCode, getColorName(curColorCode), curSizeCode, getSizeName(curSizeCode),
     curRatio, curR, curG, curB);
+
+  // 카메라 · Wi-Fi · 시스템
+  unsigned long now = millis();
+  unsigned long lastFrame = lastFrameMs;
+  n = jsonAppend(json, cap, n,
+    ",\"uptime\":%lu,\"heap\":%u,\"psram\":%u,"
+    "\"camera\":{\"ok\":%s,\"pid\":%u,\"fails\":%lu,\"lastFrameAgo\":%ld},"
+    "\"wifi\":{\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"host\":\"%s\"}",
+    now, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(),
+    cameraOk ? "true" : "false", (unsigned)camPid, (unsigned long)camFails,
+    lastFrame ? (long)(now - lastFrame) : -1L,
+    ssid, WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(), HOSTNAME);
+
+  // Modbus: 설정, 통신 통계, 레지스터 값 (40001~)
+  uint32_t req_n = mbReqCount;
+  unsigned long lastReq = mbLastReqMs;
+  n = jsonAppend(json, cap, n,
+    ",\"modbus\":{\"enabled\":%s,\"slave\":%d,\"baud\":%d,\"dePin\":%d,\"linkTimeout\":%lu,"
+    "\"requests\":%lu,\"ok\":%lu,\"lastAgo\":%ld,\"lastFc\":%u,\"lastAddr\":%u,\"lastArg\":%u,\"lastOk\":%s,\"regs\":[",
+    ENABLE_MODBUS ? "true" : "false", SLAVE_ID, MODBUS_BAUD, RS485_DE_RE_PIN, MB_LINK_TIMEOUT_MS,
+    (unsigned long)req_n, (unsigned long)mbOkCount, req_n ? (long)(now - lastReq) : -1L,
+    (unsigned)mbLastFc, (unsigned)mbLastAddr, (unsigned)mbLastArg, mbLastOk ? "true" : "false");
+  for (int i = 0; i < REG_COUNT; i++) n = jsonAppend(json, cap, n, "%s%u", i ? "," : "", (unsigned)regMirror[i]);
+  n = jsonAppend(json, cap, n, "]}}");
+  if (n >= cap) return httpd_resp_send_500(req);
+
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -1090,6 +1413,7 @@ void startWebServers() {
   httpd_uri_t uris[] = {
     {.uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL},
     {.uri = "/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL},
+    {.uri = "/events", .method = HTTP_GET, .handler = events_handler, .user_ctx = NULL},
     {.uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL},
     {.uri = "/raw.bmp", .method = HTTP_GET, .handler = raw_bmp_handler, .user_ctx = NULL},
     {.uri = "/relearn", .method = HTTP_GET, .handler = relearn_handler, .user_ctx = NULL},
@@ -1107,11 +1431,48 @@ void startWebServers() {
   }
 }
 
+// Wi-Fi 연결/끊김 처리(웹 서버·mDNS 시작)와 Modbus 통신 상태 변화를 이벤트로 남긴다
+static void networkTask() {
+  static unsigned long lastCheck = 0;
+  static bool wifiUp = false, mdnsStarted = false, mbLinkUp = false;
+  unsigned long now = millis();
+  if (now - lastCheck < 500) return;
+  lastCheck = now;
+
+  if (ENABLE_WEB) {
+    bool up = WiFi.status() == WL_CONNECTED;
+    if (up && !wifiUp) {
+      if (!webStarted) { startWebServers(); webStarted = true; }
+      if (!mdnsStarted && MDNS.begin(HOSTNAME)) {
+        MDNS.addService("http", "tcp", 80);
+        mdnsStarted = true;
+      }
+      EVENT("[WiFi] 연결됨: http://%s (http://%s.local) RSSI %d dBm",
+            WiFi.localIP().toString().c_str(), HOSTNAME, (int)WiFi.RSSI());
+    } else if (!up && wifiUp) {
+      EVENT("[WiFi] 연결 끊김 — 자동 재연결 시도 중");
+    }
+    wifiUp = up;
+  }
+
+  if (ENABLE_MODBUS) {
+    bool link = mbReqCount > 0 && now - mbLastReqMs < MB_LINK_TIMEOUT_MS;
+    if (link && !mbLinkUp) {
+      EVENT("[485] PLC 요청 수신 시작 (FC%02u, 주소 %u, %s)", (unsigned)mbLastFc, 40001u + mbLastAddr,
+            mbLastOk ? "정상 응답" : "오류 응답");
+    } else if (!link && mbLinkUp) {
+      EVENT("[485] %lu초 넘게 PLC 요청 없음", MB_LINK_TIMEOUT_MS / 1000);
+    }
+    mbLinkUp = link;
+  }
+}
+
 // ==========================================
 // 17. 초기 설정 (Setup)
 // ==========================================
 void setup() {
-  if (ENABLE_DEBUG_MODE) Serial.begin(115200);
+  if (SERIAL_LOG) Serial.begin(115200);
+  evtMutex = xSemaphoreCreateMutex();
 
   camera_config_t config = {};   // 미설정 필드(fb_location 등)가 쓰레기값이 되지 않도록 0 초기화
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -1139,13 +1500,10 @@ void setup() {
   config.fb_count = 2;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.grab_mode = CAMERA_GRAB_LATEST;
-  if (esp_camera_init(&config) != ESP_OK) {
-    LOG("[ERR] 카메라 초기화 실패\n");
-    while (true) { delay(1000); }
-  }
-
-  sensor_t *s = esp_camera_sensor_get();
-  LOG("[Info] 카메라 센서 PID=0x%02X\n", s->id.PID);
+  // 카메라가 실패해도 멈추지 않는다 — 웹/Modbus는 계속 동작해서 실패 상태를 확인할 수 있게 한다
+  esp_err_t camErr = esp_camera_init(&config);
+  cameraOk = camErr == ESP_OK;
+  if (cameraOk) camPid = esp_camera_sensor_get()->id.PID;
 
   bgR = (uint8_t *)allocBig(IMG_N);
   bgG = (uint8_t *)allocBig(IMG_N);
@@ -1155,46 +1513,54 @@ void setup() {
   bfsQueue = (uint16_t *)allocBig(IMG_N * sizeof(uint16_t));
   footMask = (uint8_t *)allocBig(IMG_N);
   if (footMask) memset(footMask, 0, IMG_N);
-  if (ENABLE_DEBUG_MODE) {
+  if (ENABLE_WEB) {
     dbgBuf = (uint8_t *)allocBig(DBG_W * DBG_H * 2);
     rawBuf = (uint8_t *)allocBig(IMG_N * 2);
     dbgMutex = xSemaphoreCreateMutex();
     if (dbgBuf) memset(dbgBuf, 0, DBG_W * DBG_H * 2);
     if (rawBuf) memset(rawBuf, 0, IMG_N * 2);
-    if (!dbgBuf || !rawBuf) { dbgBuf = nullptr; LOG("[ERR] 디버그 버퍼 할당 실패\n"); }
+    if (!dbgBuf || !rawBuf) { dbgBuf = nullptr; EVENT("[ERR] 디버그 버퍼 할당 실패"); }
   }
   if (!bgR || !bgG || !bgB || !fgRaw || !fgMap || !bfsQueue || !footMask) {
     LOG("[ERR] 작업 버퍼 할당 실패\n");
     while (true) { delay(1000); }
   }
 
-  if (!ENABLE_DEBUG_MODE) {
-    WiFi.mode(WIFI_OFF);
+  if (cameraOk) {
+    EVENT("[CAM] 카메라 정상 (센서 PID=0x%02X)", (unsigned)camPid);
+  } else {
+    EVENT("[ERR] 카메라 초기화 실패 (0x%x) — 카메라 배선/전원 확인 후 재부팅", (unsigned)camErr);
+  }
+
+  if (ENABLE_MODBUS) {
+    // UART0를 Modbus에 넘기기 전에 115200bps로 안내 한 줄 — 시리얼 모니터가 조용한 이유를 알 수 있게
+    Serial.begin(115200);
+    Serial.printf("\n[Info] Modbus 485 모드 (ENABLE_MODBUS=true): 이후 시리얼 로그 없음. "
+                  "상태는 웹 http://%s.local 에서 확인\n", HOSTNAME);
+    Serial.flush();
+    Serial.end();
     Serial.begin(MODBUS_BAUD, SERIAL_8N1);
     mb.begin(&Serial, RS485_DE_RE_PIN);
     mb.slave(SLAVE_ID);
-    mb.addHreg(REG_COLOR_CODE, 0);
-    mb.addHreg(REG_R_VAL, 0);
-    mb.addHreg(REG_G_VAL, 0);
-    mb.addHreg(REG_B_VAL, 0);
-    mb.addHreg(REG_DETECT_CNT, 0);
-    mb.addHreg(REG_SIZE_CODE, 0);
-    mb.addHreg(REG_RATIO_X100, 0);
-    mb.addHreg(REG_PRESENT, 0);
-    mb.addHreg(REG_COMMAND, 0);
+    for (int i = 0; i < REG_COUNT; i++) mb.addHreg(i, 0);
+    mb.onRequest(onMbRequest);           // 통신 상태(요청 수/마지막 요청) 집계
+    mb.onRequestSuccess(onMbSuccess);
+    EVENT("[485] Modbus RTU 시작: 슬레이브 ID %d, %dbps 8N1, 40001~%d", SLAVE_ID, MODBUS_BAUD, 40000 + REG_COUNT);
+  }
+
+  // Wi-Fi는 기다리지 않는다 (Modbus 운용 중 Wi-Fi가 없어도 멈추지 않게). 연결되면 networkTask()가 웹 서버를 시작
+  if (ENABLE_WEB) {
+    WiFi.setHostname(HOSTNAME);
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(ssid, password);
+  } else {
+    WiFi.mode(WIFI_OFF);
   }
 
   // 빈 판에서 자동 노출/화이트밸런스로 적응(2초) → 고정 → 배경 평균 학습
   //   ※ 부팅 시 판 위에 물체가 없어야 함. 있었다면 치운 뒤 웹의 '배경 재학습' 또는 Modbus 40009에 1 쓰기
-  learnBackground(true);
-
-  if (ENABLE_DEBUG_MODE) {
-    WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED) { delay(500); }
-    Serial.print("\n[Info] 웹 디버그 주소: http://");
-    Serial.println(WiFi.localIP());
-    startWebServers();
-  }
+  if (cameraOk) learnBackground(true);
 }
 
 // ==========================================
@@ -1204,26 +1570,39 @@ void loop() {
   static unsigned long fpsT0 = 0;
   static int fpsFrames = 0;
 
-  if (!ENABLE_DEBUG_MODE) {
+  if (ENABLE_MODBUS) {
     mb.task();
-    if (mb.Hreg(REG_COMMAND) == 1) {
-      mb.Hreg(REG_COMMAND, 2);
+    // 웹 표시용 사본을 실제 레지스터 값으로 맞춘다 (PLC가 쓴 값 포함)
+    for (int i = 0; i < REG_COUNT; i++) regMirror[i] = mb.Hreg(i);
+    if (regMirror[REG_COMMAND] == 1) {
+      setReg(REG_COMMAND, 2);
       relearnRequested = true;
+      EVENT("[485] PLC 명령: 배경 재학습 (40009 = 1)");
     }
   }
+  networkTask();
 
   if (relearnRequested) {
     relearnRequested = false;
-    LOG("[BG] 배경 재학습 시작...\n");
-    learnBackground(true);
-    if (!ENABLE_DEBUG_MODE) mb.Hreg(REG_COMMAND, 0);
+    if (cameraOk) {
+      EVENT("[BG] 배경 재학습 시작...");
+      learnBackground(true);
+    } else {
+      EVENT("[BG] 카메라 초기화 실패 상태라 재학습할 수 없음");
+    }
+    setReg(REG_COMMAND, 0);
   }
 
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (fb) {
-    processFrame(fb);
-    esp_camera_fb_return(fb);
-    fpsFrames++;
+  if (cameraOk) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) {
+      lastFrameMs = millis();
+      processFrame(fb);
+      esp_camera_fb_return(fb);
+      fpsFrames++;
+    } else {
+      camFails = camFails + 1;
+    }
   }
   if (millis() - fpsT0 >= 1000) {
     fps = fpsFrames * 1000.0f / (millis() - fpsT0);
@@ -1231,15 +1610,14 @@ void loop() {
     fpsT0 = millis();
   }
 
-  if (ENABLE_DEBUG_MODE && hasNewDetection) {
-    Serial.printf("[#%d] 색상 %d:%s (R:%d G:%d B:%d) | 크기 %d:%s (변 비율: %.2f)\n",
-      detectCount,
-      curColorCode, getColorName(curColorCode),
-      curR, curG, curB,
-      curSizeCode, getSizeName(curSizeCode),
-      curRatio);
+  // 프레임 수신 실패는 10초에 한 번만 기록
+  static uint32_t failsLogged = 0;
+  static unsigned long failLogMs = 0;
+  if (camFails != failsLogged && millis() - failLogMs >= 10000) {
+    EVENT("[CAM] 프레임 수신 실패 (누적 %lu회)", (unsigned long)camFails);
+    failsLogged = camFails;
+    failLogMs = millis();
   }
-  hasNewDetection = false;
 
   serviceDelay(1);
 }
