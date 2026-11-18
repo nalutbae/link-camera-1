@@ -5,6 +5,11 @@
 #include <ESPmDNS.h>
 #include <stdarg.h>
 #include "esp_camera.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "esp_netif_net_stack.h"
+#include "lwip/etharp.h"
+#include "lwip/tcpip.h"
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
 #include "img_converters.h"
@@ -31,6 +36,19 @@
 const char *ssid = "1실습실_2.4G";
 const char *password = "tank5000";
 const char *HOSTNAME = "link-cam1";     // 시리얼 없이 접속: http://link-cam1.local (또는 공유기 DHCP 목록에서 IP 확인)
+
+// Wi-Fi 연결 안정화 (거리가 멀고 사람·장비가 가로막는 현장용)
+//   고정 IP: 처음에 DHCP로 접속한 뒤 후보 주소를 앞에서부터 ARP로 물어보고, 응답이 없는(비어 있는) 첫 주소를 쓴다.
+//            게이트웨이·서브넷·DNS는 DHCP로 받은 값을 그대로 쓴다. 후보가 모두 사용 중이면 DHCP 주소를 유지한다.
+#define WIFI_STATIC_IP    true          // false = 항상 DHCP
+const IPAddress STATIC_IP_CANDIDATES[] = {
+  IPAddress(192, 168, 10, 230), IPAddress(192, 168, 10, 231),
+  IPAddress(192, 168, 10, 232), IPAddress(192, 168, 10, 233),
+};
+#define WIFI_COUNTRY      "KR"          // 국가 코드 (채널 1~13 사용 가능)
+#define WIFI_11B_ONLY     false         // true = 802.11b 전용: 속도는 느리지만 먼 거리 수신 감도가 좋아짐 (공유기가 11b를 허용해야 함)
+#define WIFI_RECONNECT_MS 30000UL       // 이 시간 넘게 끊겨 있으면 연결을 처음부터 다시 시도
+#define STREAM_MAX_FPS    5             // 웹 영상 스트림 최대 초당 프레임 (약한 신호에서 상태 화면이 멈추지 않게 대역 절약)
 
 #define SLAVE_ID        6
 #define MODBUS_BAUD     9600
@@ -261,6 +279,18 @@ volatile unsigned long mbLastReqMs = 0;
 volatile uint8_t  mbLastFc = 0;
 volatile uint16_t mbLastAddr = 0, mbLastArg = 0;  // 시작 주소(0-based), 개수(FC06이면 쓴 값)
 volatile bool     mbLastOk = false;
+
+// Wi-Fi 상태 (웹 표시용)
+enum IpMode : uint8_t { IPM_DHCP, IPM_PROBING, IPM_STATIC, IPM_FALLBACK };
+const char *IPM_NAMES[] = {"dhcp", "probing", "static", "fallback"};
+volatile uint8_t ipMode = IPM_DHCP;
+volatile uint8_t wifiDiscReason = 0;         // 마지막 끊김 사유 코드 (Wi-Fi 이벤트 콜백에서 기록)
+volatile int8_t  wifiDiscRssi = 0;           // 끊길 때의 신호 세기
+volatile unsigned long wifiDiscMs = 0;
+volatile uint32_t wifiDrops = 0;             // 연결된 상태에서 끊긴 횟수
+volatile unsigned long wifiUpSinceMs = 0;    // 현재 연결이 시작된 시각 (0 = 끊김)
+volatile int wifiRssiAvg = 0, wifiRssiMin = 0, wifiRssiMinBoot = 0;  // 최근 1분 평균·최저, 부팅 후 최저
+static const char *wifiReasonText(uint8_t r);
 
 // 웹 '감지 기록' 링버퍼
 #define EVT_MAX 40
@@ -1085,6 +1115,9 @@ button:hover{background:#344050}
 a{color:var(--acc)}
 .row{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin-top:10px}
 .legend{color:var(--mute);font-size:12px;margin-top:8px}
+.bar{display:inline-block;height:8px;min-width:2px;border-radius:4px;background:var(--warn);vertical-align:middle}
+td.b{width:45%}tr.rec td{background:#16351f}
+button:disabled{opacity:.5;cursor:wait}
 summary{cursor:pointer;color:var(--mute);font-weight:600;font-size:13px}
 details[open] summary{margin-bottom:10px}
 </style></head><body>
@@ -1121,6 +1154,12 @@ details[open] summary{margin-bottom:10px}
 <section class="card">
  <h2>카메라 · 시스템</h2>
  <dl class="kv" id="sysKv"></dl>
+</section>
+<section class="card wide">
+ <h2>Wi-Fi <span id="wfPill" class="pill"></span></h2>
+ <dl class="kv" id="wfKv"></dl>
+ <div class="row"><button id="scanBtn" onclick="wifiScan()">주변 채널 검사</button><span class="sub" id="scanMsg">이 장치 위치에서 보이는 공유기의 채널과 신호를 검사합니다 (2~4초, 그동안 영상이 잠깐 멈출 수 있음)</span></div>
+ <div id="scanRes"></div>
 </section>
 <details class="card wide" id="det"><summary>상세 측정값 (JSON)</summary><pre id="st"></pre></details>
 </main>
@@ -1197,12 +1236,50 @@ function render(j){
   ['카메라',cam.ok?`<span class="pill ok">정상</span> ${PIDS[cam.pid]||''} (PID 0x${cam.pid.toString(16).toUpperCase()})`:'<span class="pill bad">초기화 실패</span> 배선/전원 확인 후 재부팅'],
   ['처리 속도',`${j.fps.toFixed(1)} fps · 처리 ${j.frame}프레임`],
   ['프레임 수신',`마지막 ${ago(cam.lastFrameAgo)} · 실패 누적 ${cam.fails}회`],
-  ['Wi-Fi',`${w.ssid} · ${w.ip} · ${w.rssi} dBm`],
-  ['주소',`http://${w.host}.local`],
   ['가동 시간',upt(j.uptime)],
   ['여유 메모리',`내부 ${(j.heap/1024).toFixed(0)}KB · PSRAM ${(j.psram/1024).toFixed(0)}KB`],
   ['판(배경)',`RGB(${j.plate.rgb.join(', ')}) · 게인 ${j.plate.gain.join(' / ')}`]]);
+ renderWifi(w);
  if($('det').open)$('st').textContent=JSON.stringify(j,null,1);
+}
+// RSSI 등급: -67 이상 양호, -75 이상 보통, 그 아래 약함
+const rq=r=>r>=-67?['양호','ok']:r>=-75?['보통','warn']:['약함','bad'];
+const IPM={dhcp:'DHCP',probing:'고정 IP 후보 확인 중',static:'고정 IP',fallback:'DHCP (고정 IP 후보 사용 불가)'};
+function renderWifi(w){
+ const q=rq(w.rssi);
+ pill($('wfPill'),`신호 ${q[0]} ${w.rssi} dBm`,q[1]);
+ kv($('wfKv'),[
+  ['공유기',`${w.ssid} · 채널 ${w.ch} · ${w.bssid}`],
+  ['IP',`${w.ip} (${IPM[w.ipMode]||w.ipMode})`],
+  ['접속 주소',`<a href="http://${w.ip}">http://${w.ip}</a> · http://${w.host}.local`],
+  ['신호(RSSI)',`현재 ${w.rssi} · 최근 1분 평균 ${w.rssiAvg} / 최저 ${w.rssiMin} · 부팅 후 최저 ${w.rssiMinBoot} dBm`],
+  ['연결 유지',`${w.upFor>=0?upt(w.upFor):'-'} · 부팅 후 끊김 ${w.drops}회`],
+  ['마지막 끊김',w.lastReasonAgo>=0?`${ago(w.lastReasonAgo)} · 사유 ${w.lastReason}: ${w.lastReasonText}`:'없음'],
+  ['설정',`절전 ${w.sleep?'켬':'끔'} · 송신 ${w.txPower} dBm · 20MHz · ${w.b11Only?'802.11b 전용':'b/g/n'} · 영상 최대 ${w.streamFps}fps`]]);
+}
+// 주변 채널 검사: 채널마다 겹치는 정도(앞뒤 4채널)와 신호 세기로 혼잡도 계산. 자기 공유기(같은 SSID)는 제외
+async function wifiScan(){
+ const btn=$('scanBtn');btn.disabled=true;$('scanMsg').textContent='검사 중…';
+ try{
+  const j=await(await fetch('/wifiscan',{cache:'no-store'})).json();
+  if(j.error){$('scanMsg').textContent='검사 실패: '+j.error;return;}
+  const score=Array(14).fill(0),cnt=Array(14).fill(0),best=Array(14).fill(-999);let others=0;
+  for(const a of j.aps){
+   if(a.s===j.ownSsid||a.ch<1||a.ch>13)continue;
+   others++;cnt[a.ch]++;best[a.ch]=Math.max(best[a.ch],a.r);
+   const occ=[a.ch];if(a.sc==1)occ.push(a.ch+4);if(a.sc==2)occ.push(a.ch-4);   // 40MHz 폭이면 보조 채널도 차지
+   for(let c=1;c<=13;c++)for(const p of occ)score[c]+=Math.max(0,1-Math.abs(p-c)/5)*Math.pow(10,a.r/10)*1e6;
+  }
+  const max=Math.max(...score.slice(1),1e-9),rec=[1,6,11].reduce((m,c)=>score[c]<score[m]?c:m,1);
+  let h='<div class="tbl"><table><thead><tr><th>채널</th><th>AP 수</th><th>가장 강한 신호</th><th class="b">혼잡도 (다른 공유기 간섭)</th></tr></thead><tbody>';
+  for(let c=1;c<=13;c++){
+   const tag=(c==j.ownCh?' · 현재':'')+(c==rec?' · 추천':'');
+   h+=`<tr${c==rec?' class="rec"':''}><td>${c}${[1,6,11].includes(c)?' ★':''}${tag}</td><td>${cnt[c]}</td><td>${cnt[c]?best[c]+' dBm':'-'}</td><td class="b"><span class="bar" style="width:${Math.round(score[c]/max*100)}%"></span></td></tr>`;
+  }
+  $('scanRes').innerHTML=h+'</tbody></table></div><p class="note">★ 1·6·11은 서로 겹치지 않는 채널입니다. 채널은 공유기 관리 화면에서 바꾸며(채널 폭 20MHz 권장), ESP32는 바뀐 채널을 자동으로 따라갑니다.</p>';
+  $('scanMsg').textContent=`다른 공유기 ${others}개 · 현재 채널 ${j.ownCh} → 추천 채널 ${rec} (1·6·11 중 가장 한산)`;
+ }catch(e){$('scanMsg').textContent='검사 실패 (장치 응답 없음)';}
+ finally{btn.disabled=false;}
 }
 async function pollStatus(){
  try{const j=await(await fetch('/status',{cache:'no-store'})).json();lastOk=Date.now();render(j);}catch(e){}
@@ -1282,7 +1359,7 @@ static size_t jsonAppend(char *buf, size_t cap, size_t n, const char *fmt, ...) 
 }
 
 static esp_err_t status_handler(httpd_req_t *req) {
-  static char json[3072];
+  static char json[4096];
   const size_t cap = sizeof(json);
   DebugStatus st;
   if (xSemaphoreTake(dbgMutex, pdMS_TO_TICKS(200)) != pdTRUE) return httpd_resp_send_500(req);
@@ -1317,11 +1394,21 @@ static esp_err_t status_handler(httpd_req_t *req) {
   n = jsonAppend(json, cap, n,
     ",\"uptime\":%lu,\"heap\":%u,\"psram\":%u,"
     "\"camera\":{\"ok\":%s,\"pid\":%u,\"fails\":%lu,\"lastFrameAgo\":%ld},"
-    "\"wifi\":{\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"host\":\"%s\"}",
+    "\"wifi\":{\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"host\":\"%s\"",
     now, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(),
     cameraOk ? "true" : "false", (unsigned)camPid, (unsigned long)camFails,
     lastFrame ? (long)(now - lastFrame) : -1L,
     ssid, WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(), HOSTNAME);
+  unsigned long upSince = wifiUpSinceMs, discMs = wifiDiscMs;
+  uint8_t reason = wifiDiscReason;
+  n = jsonAppend(json, cap, n,
+    ",\"ch\":%d,\"bssid\":\"%s\",\"ipMode\":\"%s\",\"rssiAvg\":%d,\"rssiMin\":%d,\"rssiMinBoot\":%d,"
+    "\"upFor\":%ld,\"drops\":%lu,\"lastReason\":%u,\"lastReasonText\":\"%s\",\"lastReasonAgo\":%ld,"
+    "\"txPower\":%.1f,\"sleep\":%s,\"b11Only\":%s,\"streamFps\":%d}",
+    (int)WiFi.channel(), WiFi.BSSIDstr().c_str(), IPM_NAMES[ipMode], wifiRssiAvg, wifiRssiMin, wifiRssiMinBoot,
+    upSince ? (long)(now - upSince) : -1L, (unsigned long)wifiDrops, (unsigned)reason, wifiReasonText(reason),
+    discMs ? (long)(now - discMs) : -1L,
+    (int)WiFi.getTxPower() / 4.0f, WiFi.getSleep() ? "true" : "false", WIFI_11B_ONLY ? "true" : "false", STREAM_MAX_FPS);
 
   // Modbus: 설정, 통신 통계, 레지스터 값 (40001~)
   uint32_t req_n = mbReqCount;
@@ -1394,7 +1481,8 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   while (res == ESP_OK) {
     // 분석은 loop()에서만 수행하고, 여기서는 최신 디버그 화면만 인코딩해서 보낸다
     if (!dbgBuf) return httpd_resp_send_500(req);
-    if (dbgFrameId == lastId && millis() - lastSend < 2000) {
+    // 새 프레임이 없거나, 최대 초당 프레임(STREAM_MAX_FPS)을 넘으면 기다린다 (2초마다는 같은 프레임이라도 보냄)
+    if ((dbgFrameId == lastId && millis() - lastSend < 2000) || millis() - lastSend < 1000UL / STREAM_MAX_FPS) {
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
@@ -1413,8 +1501,48 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)jpg, len);
     free(jpg);
     lastSend = millis();
-    vTaskDelay(pdMS_TO_TICKS(30));
   }
+  return res;
+}
+
+// JSON 문자열 이스케이프 (SSID에 따옴표 등이 있을 수 있음)
+static void jsonEscape(char *out, size_t cap, const char *s) {
+  size_t n = 0;
+  for (; *s && n + 7 < cap; s++) {
+    unsigned char ch = (unsigned char)*s;
+    if (ch == '"' || ch == '\\') { out[n++] = '\\'; out[n++] = ch; }
+    else if (ch < 0x20) n += snprintf(out + n, cap - n, "\\u%04x", ch);
+    else out[n++] = ch;
+  }
+  out[n] = 0;
+}
+
+// 주변 Wi-Fi 검사: 장치 위치에서 보이는 공유기의 채널·신호 세기 (약 2~4초 걸림, 그동안 영상이 잠깐 멈출 수 있음)
+static esp_err_t wifiscan_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  int n = WiFi.scanNetworks(false, true, false, 150);   // 동기 · 숨은 SSID 포함 · 능동 검색 · 채널당 150ms
+  if (n < 0) {
+    WiFi.scanDelete();
+    return httpd_resp_sendstr(req, "{\"error\":\"검색 실패 (Wi-Fi 재연결 중일 수 있음)\"}");
+  }
+  char esc[80], line[200];
+  jsonEscape(esc, sizeof(esc), ssid);
+  int len = snprintf(line, sizeof(line), "{\"ownSsid\":\"%s\",\"ownCh\":%d,\"ownBssid\":\"%s\",\"aps\":[",
+                     esc, (int)WiFi.channel(), WiFi.BSSIDstr().c_str());
+  esp_err_t res = httpd_resp_send_chunk(req, line, len);
+  for (int i = 0; i < n && res == ESP_OK; i++) {
+    wifi_ap_record_t *ap = (wifi_ap_record_t *)WiFi.getScanInfoByIndex(i);
+    if (!ap) continue;
+    jsonEscape(esc, sizeof(esc), (const char *)ap->ssid);
+    len = snprintf(line, sizeof(line), "%s{\"s\":\"%s\",\"b\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"ch\":%u,\"sc\":%u,\"r\":%d}",
+                   i ? "," : "", esc, ap->bssid[0], ap->bssid[1], ap->bssid[2], ap->bssid[3], ap->bssid[4], ap->bssid[5],
+                   (unsigned)ap->primary, (unsigned)ap->second, (int)ap->rssi);
+    res = httpd_resp_send_chunk(req, line, len);
+  }
+  WiFi.scanDelete();
+  if (res == ESP_OK) res = httpd_resp_send_chunk(req, "]}", 2);
+  if (res == ESP_OK) res = httpd_resp_send_chunk(req, NULL, 0);
   return res;
 }
 
@@ -1429,6 +1557,7 @@ void startWebServers() {
     {.uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL},
     {.uri = "/raw.bmp", .method = HTTP_GET, .handler = raw_bmp_handler, .user_ctx = NULL},
     {.uri = "/relearn", .method = HTTP_GET, .handler = relearn_handler, .user_ctx = NULL},
+    {.uri = "/wifiscan", .method = HTTP_GET, .handler = wifiscan_handler, .user_ctx = NULL},
   };
   if (httpd_start(&web_httpd, &config) == ESP_OK) {
     for (auto &u : uris) httpd_register_uri_handler(web_httpd, &u);
@@ -1443,10 +1572,150 @@ void startWebServers() {
   }
 }
 
-// Wi-Fi 연결/끊김 처리(웹 서버·mDNS 시작)와 Modbus 통신 상태 변화를 이벤트로 남긴다
+// ---------- Wi-Fi 보조 함수 ----------
+
+// 끊김 사유 코드 → 설명 (ESP-IDF wifi_err_reason_t)
+static const char *wifiReasonText(uint8_t r) {
+  switch (r) {
+    case 0:   return "없음";
+    case 2:   return "인증 만료";
+    case 3:   return "공유기가 연결을 끊음";
+    case 4:   return "무응답으로 공유기가 연결을 끊음";
+    case 8:   return "장치가 연결을 끊음 (재접속 시도)";
+    case 15:  return "4-way 핸드셰이크 시간 초과 (신호 약함 또는 비밀번호)";
+    case 200: return "비컨 수신 끊김 (신호 약함·간섭)";
+    case 201: return "공유기를 찾지 못함 (신호 약함·꺼짐·SSID 확인)";
+    case 202: return "인증 실패 (비밀번호 확인)";
+    case 203: return "연결 실패";
+    case 204: return "핸드셰이크 시간 초과 (신호 약함 또는 비밀번호)";
+    case 205: return "연결 실패";
+    default:  return WiFi.STA.disconnectReasonName((wifi_err_reason_t)r);
+  }
+}
+
+// Wi-Fi 이벤트 태스크에서 호출됨 — 값만 기록하고, 로그는 networkTask()가 남긴다
+static void onWiFiDisconnected(arduino_event_id_t, arduino_event_info_t info) {
+  wifiDiscReason = info.wifi_sta_disconnected.reason;
+  wifiDiscRssi = info.wifi_sta_disconnected.rssi;
+  wifiDiscMs = millis();
+}
+
+// ARP로 주소 사용 여부 확인 (lwIP 코어 잠금 후 호출 — 이 프레임워크는 CONFIG_LWIP_TCPIP_CORE_LOCKING=1)
+static struct netif *staLwipNetif() {
+  esp_netif_t *en = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  return en ? (struct netif *)esp_netif_get_netif_impl(en) : nullptr;
+}
+static void arpAsk(const IPAddress &ip) {
+  struct netif *nif = staLwipNetif();
+  if (!nif) return;
+  ip4_addr_t a;
+  a.addr = (uint32_t)ip;
+  LOCK_TCPIP_CORE();
+  etharp_request(nif, &a);
+  UNLOCK_TCPIP_CORE();
+}
+static bool arpAnswered(const IPAddress &ip) {
+  struct netif *nif = staLwipNetif();
+  if (!nif) return false;
+  ip4_addr_t a;
+  a.addr = (uint32_t)ip;
+  struct eth_addr *mac = nullptr;
+  const ip4_addr_t *ipRet = nullptr;
+  LOCK_TCPIP_CORE();
+  ssize_t idx = etharp_find_addr(nif, &a, &mac, &ipRet);
+  UNLOCK_TCPIP_CORE();
+  return idx >= 0;
+}
+
+static void startWebAndMdns() {
+  static bool mdnsStarted = false;
+  if (!webStarted) { startWebServers(); webStarted = true; }
+  if (!mdnsStarted && MDNS.begin(HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+    mdnsStarted = true;
+  }
+}
+
+static void announceConnected(unsigned long downMs) {
+  startWebAndMdns();
+  char down[40] = "";
+  if (downMs) snprintf(down, sizeof(down), ", %lu초 만에 복구", downMs / 1000);
+  EVENT("[WiFi] 연결됨: http://%s (http://%s.local) 채널 %d, RSSI %d dBm, %s%s",
+        WiFi.localIP().toString().c_str(), HOSTNAME, (int)WiFi.channel(), (int)WiFi.RSSI(),
+        ipMode == IPM_STATIC ? "고정 IP" : "DHCP", down);
+}
+
+// 고정 IP 후보 확인: 0.5초마다 한 단계씩 진행 (카메라 처리·485 응답을 막지 않게)
+//   후보마다 ARP 요청을 최대 3번 보내고, 응답이 없으면 비어 있는 주소로 보고 사용한다
+static void ipProbeStep(unsigned long now) {
+  static uint8_t idx = 0, tries = 0;
+  const uint8_t n = sizeof(STATIC_IP_CANDIDATES) / sizeof(STATIC_IP_CANDIDATES[0]);
+  if (ipMode != IPM_PROBING) return;
+  const IPAddress &cand = STATIC_IP_CANDIDATES[idx];
+  IPAddress me = WiFi.localIP(), mask = WiFi.subnetMask();
+
+  if (tries == 0) {
+    if (((uint32_t)cand & (uint32_t)mask) != ((uint32_t)me & (uint32_t)mask)) {
+      ipMode = IPM_FALLBACK;
+      EVENT("[WiFi] 고정 IP 후보(%s)가 현재 네트워크(%s)와 달라 DHCP 주소를 사용",
+            cand.toString().c_str(), me.toString().c_str());
+      announceConnected(0);
+      return;
+    }
+  }
+  bool taken = cand != me && tries > 0 && arpAnswered(cand);
+  if (taken) {
+    EVENT("[WiFi] %s 사용 중 (다른 장치가 응답)%s", cand.toString().c_str(), idx + 1 < n ? " → 다음 후보" : "");
+    idx++;
+    tries = 0;
+    if (idx >= n) {
+      ipMode = IPM_FALLBACK;
+      EVENT("[WiFi] 고정 IP 후보가 모두 사용 중 — DHCP 주소 %s 유지", me.toString().c_str());
+      announceConnected(0);
+    }
+    return;
+  }
+  if (cand == me || tries >= 3) {    // 지금 내 주소이거나, 3번 물어도 응답 없음 → 비어 있음
+    IPAddress gw = WiFi.gatewayIP(), dns1 = WiFi.dnsIP(0), dns2 = WiFi.dnsIP(1);
+    if (WiFi.config(cand, gw, mask, dns1, dns2)) {
+      ipMode = IPM_STATIC;
+      EVENT("[WiFi] 고정 IP %s 사용 (게이트웨이 %s, DHCP로 받았던 주소 %s)",
+            cand.toString().c_str(), gw.toString().c_str(), me.toString().c_str());
+    } else {
+      ipMode = IPM_FALLBACK;
+      EVENT("[WiFi] 고정 IP 설정 실패 — DHCP 주소 %s 유지", me.toString().c_str());
+    }
+    announceConnected(0);
+    return;
+  }
+  arpAsk(cand);
+  tries++;
+}
+
+// RSSI 기록: 2초마다, 최근 1분(30개) 평균·최저와 부팅 후 최저
+static void sampleRssi() {
+  static int8_t hist[30];
+  static uint8_t cnt = 0, pos = 0;
+  int r = WiFi.RSSI();
+  if (r >= 0 || r < -127) return;
+  hist[pos] = r;
+  pos = (pos + 1) % 30;
+  if (cnt < 30) cnt++;
+  int sum = 0, mn = 0;
+  for (int i = 0; i < cnt; i++) {
+    sum += hist[i];
+    if (i == 0 || hist[i] < mn) mn = hist[i];
+  }
+  wifiRssiAvg = sum / cnt;
+  wifiRssiMin = mn;
+  if (wifiRssiMinBoot == 0 || r < wifiRssiMinBoot) wifiRssiMinBoot = r;
+}
+
+// Wi-Fi 연결/끊김 처리(고정 IP 결정, 웹 서버·mDNS 시작, 재연결 감시)와 Modbus 통신 상태 변화를 이벤트로 남긴다
 static void networkTask() {
-  static unsigned long lastCheck = 0;
-  static bool wifiUp = false, mdnsStarted = false, mbLinkUp = false;
+  static unsigned long lastCheck = 0, lastRssi = 0, retryMs = 0, downSinceMs = 0;
+  static uint32_t retries = 0;
+  static bool wifiUp = false, mbLinkUp = false;
   unsigned long now = millis();
   if (now - lastCheck < 500) return;
   lastCheck = now;
@@ -1454,17 +1723,42 @@ static void networkTask() {
   if (ENABLE_WEB) {
     bool up = WiFi.status() == WL_CONNECTED;
     if (up && !wifiUp) {
-      if (!webStarted) { startWebServers(); webStarted = true; }
-      if (!mdnsStarted && MDNS.begin(HOSTNAME)) {
-        MDNS.addService("http", "tcp", 80);
-        mdnsStarted = true;
+      wifiUpSinceMs = now;
+      unsigned long downMs = downSinceMs ? now - downSinceMs : 0;
+      downSinceMs = 0;
+      retries = 0;
+      if (WIFI_STATIC_IP && ipMode == IPM_DHCP) {
+        ipMode = IPM_PROBING;     // 첫 연결: 고정 IP 후보 확인 후 웹 서버 시작
+        EVENT("[WiFi] 공유기 연결됨 (DHCP %s, 채널 %d, RSSI %d dBm) — 고정 IP 후보 확인 중",
+              WiFi.localIP().toString().c_str(), (int)WiFi.channel(), (int)WiFi.RSSI());
+      } else {
+        announceConnected(downMs);
       }
-      EVENT("[WiFi] 연결됨: http://%s (http://%s.local) RSSI %d dBm",
-            WiFi.localIP().toString().c_str(), HOSTNAME, (int)WiFi.RSSI());
     } else if (!up && wifiUp) {
-      EVENT("[WiFi] 연결 끊김 — 자동 재연결 시도 중");
+      wifiUpSinceMs = 0;
+      downSinceMs = retryMs = now;
+      wifiDrops = wifiDrops + 1;
+      uint8_t rs = wifiDiscReason;
+      EVENT("[WiFi] 연결 끊김 (사유 %u: %s, 직전 RSSI %d dBm) — 자동 재연결 시도 중",
+            (unsigned)rs, wifiReasonText(rs), (int)wifiDiscRssi);
     }
     wifiUp = up;
+
+    if (up) {
+      ipProbeStep(now);
+      if (now - lastRssi >= 2000) { lastRssi = now; sampleRssi(); }
+    } else if (now - retryMs >= WIFI_RECONNECT_MS) {
+      // 자동 재연결이 멈춘 경우를 대비해 연결을 처음부터 다시 시작 (로그는 처음 3번, 이후 10번마다)
+      retryMs = now;
+      retries++;
+      uint8_t rs = wifiDiscReason;
+      if (retries <= 3 || retries % 10 == 0) {
+        EVENT("[WiFi] %lu초 넘게 연결 안 됨 — 연결을 처음부터 다시 시도 (%lu회째, 마지막 사유 %u: %s)",
+              WIFI_RECONNECT_MS / 1000, (unsigned long)retries, (unsigned)rs, wifiReasonText(rs));
+      }
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+    }
   }
 
   if (ENABLE_MODBUS) {
@@ -1566,10 +1860,18 @@ void setup() {
 
   // Wi-Fi는 기다리지 않는다 (Modbus 운용 중 Wi-Fi가 없어도 멈추지 않게). 연결되면 networkTask()가 웹 서버를 시작
   if (ENABLE_WEB) {
+    WiFi.onEvent(onWiFiDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
     WiFi.setHostname(HOSTNAME);
+    WiFi.setSleep(false);                          // 절전 끄기: 약한 신호에서 패킷을 놓쳐 끊기는 일을 줄인다 (전류는 조금 늘어남)
+    WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);     // 모든 채널을 검색해서
+    WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL); // 같은 이름의 공유기가 여럿이면 신호가 가장 센 곳에 연결
     WiFi.mode(WIFI_STA);
+    esp_wifi_set_country_code(WIFI_COUNTRY, true); // 채널 1~13
+    if (WIFI_11B_ONLY) esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);  // 20MHz 폭: 붐비는 2.4GHz에서 간섭을 덜 받는다
     WiFi.setAutoReconnect(true);
     WiFi.begin(ssid, password);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);           // 송신 출력 최대
   } else {
     WiFi.mode(WIFI_OFF);
   }
