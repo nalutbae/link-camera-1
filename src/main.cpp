@@ -16,13 +16,14 @@
 // ==========================================
 //  ENABLE_WEB    true  = Wi-Fi 웹 화면: 영상/마스크, 감지 기록(시스템 로그), Modbus 레지스터 값, 통신·카메라 상태
 //                        → USB 개발보드(ESP32-CAM-MB) 없이 485 운용 중에도 브라우저로 상태 확인
-//  ENABLE_MODBUS true  = UART2(GPIO14/15)로 Modbus RTU 485 통신
-//  SERIAL_LOG    true  = UART0(GPIO1/3, USB 개발보드)로 시리얼 로그 115200bps
-//  → 485는 UART2, 로그는 UART0으로 분리되어 있어 셋 다 동시에 켤 수 있다.
-//    485 모듈을 연결한 채로 ESP32-CAM-MB로 업로드·시리얼 모니터 가능.
+//  ENABLE_MODBUS true  = UART0(U0T=GPIO1 / U0R=GPIO3)로 Modbus RTU 485 통신 (현장 운용: 485 모듈 연결)
+//                false = 같은 UART0로 시리얼 로그 출력 (개발: ESP32-CAM-MB에 꽂아 시리얼 모니터로 볼 때)
+//                ※ UART0는 USB 업로드·시리얼 모니터와 같은 핀이다.
+//                  - true로 올리면 시리얼 모니터에는 부팅 안내 한 줄 외에 아무것도 나오지 않는다 (정상)
+//                  - 485 운용 중에는 ESP32-CAM-MB를 빼고, 업로드할 때는 485 모듈의 TXD/RXD 선을 뺀다
 #define ENABLE_WEB    true
 #define ENABLE_MODBUS true
-#define SERIAL_LOG    true
+#define SERIAL_LOG    (!ENABLE_MODBUS)   // UART0는 하나뿐이라 Modbus와 시리얼 로그를 동시에 쓸 수 없다
 
 // ==========================================
 // 2. Wi-Fi 및 Modbus RTU 설정
@@ -33,11 +34,10 @@ const char *HOSTNAME = "link-cam1";     // 시리얼 없이 접속: http://link-
 
 #define SLAVE_ID        6
 #define MODBUS_BAUD     9600
-// 485 모듈 연결 핀 (UART2). AI-Thinker ESP32-CAM에서 비어 있는 핀 — microSD 카드는 끼우지 말 것 (같은 핀 사용)
-//   GPIO16은 PSRAM, GPIO12는 부팅 전압 설정 핀이라 쓰면 안 된다
-#define MB_SERIAL       Serial2
-#define MB_TX_PIN       14      // ESP32 송신 → 485 모듈
-#define MB_RX_PIN       15      // 485 모듈 → ESP32 수신
+// 485 모듈 연결 핀 (UART0, ESP32-CAM 기본 시리얼 핀). 보드 인쇄: U0T = GPIO1, U0R = GPIO3
+#define MB_SERIAL       Serial
+#define MB_TX_PIN       1       // U0T: ESP32 송신 → 485 모듈
+#define MB_RX_PIN       3       // U0R: 485 모듈 → ESP32 수신
 // 485 송수신 방향 제어 핀
 //   -1 : 자동 방향 모듈 (TTL485-V2.0 등 VCC/TXD/RXD/GND 4핀) — 연결할 핀 없음
 //   13 : MAX485처럼 DE/RE 핀이 있는 모듈 — DE와 RE를 묶어 GPIO13에 연결
@@ -1176,11 +1176,11 @@ function render(j){
  [...tb.rows].forEach((tr,i)=>{const v=regs[i];tr.cells[3].textContent=v;tr.cells[4].textContent='0x'+v.toString(16).toUpperCase().padStart(4,'0');tr.cells[6].textContent=REGS[i][1](v);
   if(prevRegs&&prevRegs[i]!==v){tr.classList.add('flash');setTimeout(()=>tr.classList.remove('flash'),80);}});
  prevRegs=regs.slice();
- pill($('mode'),m.enabled?'Modbus 485 사용':'Modbus 꺼짐',m.enabled?'ok':'warn');
+ pill($('mode'),m.enabled?'운용: Modbus 485 + 웹':'디버그: 시리얼 로그 + 웹',m.enabled?'ok':'warn');
  $('mbCfg').textContent=`슬레이브 ID ${m.slave} · ${m.baud}bps 8N1 · TX GPIO${m.txPin} · RX GPIO${m.rxPin} · `+(m.dePin<0?'자동 방향 모듈':`DE/RE GPIO${m.dePin}`);
  let hint='';
  if(!m.enabled){pill($('mbPill'),'통신 꺼짐','warn');
-  kv($('mbKv'),[['Modbus','꺼짐 (ENABLE_MODBUS = false)']]);
+  kv($('mbKv'),[['Modbus','꺼짐 (ENABLE_MODBUS = false)'],['UART0 (GPIO1/3)','시리얼 로그 출력용 (115200bps)']]);
   hint='표의 값은 통신을 켰을 때 PLC가 읽게 될 값입니다.';
  }else{
   const live=m.lastAgo>=0&&m.lastAgo<m.linkTimeout;
@@ -1188,7 +1188,7 @@ function render(j){
   const r=[['수신 요청',`${m.requests}회 (정상 ${m.ok} · 오류 응답 ${m.requests-m.ok})`],['마지막 요청',m.requests?ago(m.lastAgo):'없음']];
   if(m.requests){r.push(['함수',`FC${String(m.lastFc).padStart(2,'0')} ${FCN[m.lastFc]||''}`],['대상',regRange(m.lastFc,m.lastAddr,m.lastArg)],['결과',m.lastOk?'<span class="pill ok">정상 응답</span>':'<span class="pill bad">오류 응답</span> 주소 범위/함수 코드 확인']);}
   kv($('mbKv'),r);
-  if(m.requests==0)hint='요청이 한 번도 없으면 TXD/RXD 연결을 서로 바꿔 보고, 485 배선(A/B), 보오율, 슬레이브 ID를 확인하세요. CRC 오류나 다른 ID로 보낸 요청은 집계되지 않습니다.';
+  if(m.requests==0)hint='요청이 한 번도 없으면 ESP32-CAM-MB가 빠져 있는지 확인하고, TXD/RXD 연결을 서로 바꿔 보고, 485 배선(A/B), 보오율, 슬레이브 ID를 확인하세요. CRC 오류나 다른 ID로 보낸 요청은 집계되지 않습니다.';
   else if(m.requests>m.ok)hint='오류 응답은 없는 주소(40010 이후 등)나 지원하지 않는 함수 코드를 요청했을 때 생깁니다.';
  }
  $('mbHint').textContent=hint;
@@ -1545,13 +1545,22 @@ void setup() {
   }
 
   if (ENABLE_MODBUS) {
+    // UART0를 Modbus에 넘기기 전에 115200bps로 안내 한 줄 — 시리얼 모니터가 조용한 이유를 알 수 있게
+    MB_SERIAL.begin(115200);
+    MB_SERIAL.printf("\n[Info] Modbus 485 모드 (ENABLE_MODBUS=true): 이후 시리얼 로그 없음. "
+                     "상태는 웹 http://%s.local 에서 확인\n", HOSTNAME);
+    MB_SERIAL.flush();
+    MB_SERIAL.end();
+    // 이후 UART0에는 Modbus 응답만 나가야 한다. 시스템·카메라 드라이버 로그가 섞이면 응답 프레임이 깨진다
+    esp_log_level_set("*", ESP_LOG_NONE);
     MB_SERIAL.begin(MODBUS_BAUD, SERIAL_8N1, MB_RX_PIN, MB_TX_PIN);
+    MB_SERIAL.setDebugOutput(false);
     mb.begin(&MB_SERIAL, RS485_DE_RE_PIN);
     mb.slave(SLAVE_ID);
     for (int i = 0; i < REG_COUNT; i++) mb.addHreg(i, 0);
     mb.onRequest(onMbRequest);           // 통신 상태(요청 수/마지막 요청) 집계
     mb.onRequestSuccess(onMbSuccess);
-    EVENT("[485] Modbus RTU 시작: 슬레이브 ID %d, %dbps 8N1, 40001~%d (UART2 TX=GPIO%d RX=GPIO%d)",
+    EVENT("[485] Modbus RTU 시작: 슬레이브 ID %d, %dbps 8N1, 40001~%d (UART0 TX=GPIO%d RX=GPIO%d)",
           SLAVE_ID, MODBUS_BAUD, 40000 + REG_COUNT, MB_TX_PIN, MB_RX_PIN);
   }
 
