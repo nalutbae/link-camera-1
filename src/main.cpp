@@ -33,9 +33,10 @@
 // ==========================================
 // 2. Wi-Fi 및 Modbus RTU 설정
 // ==========================================
-const char *ssid = "1실습실_2.4G";
+// const char *ssid = "1실습실_2.4G"; 
+const char *ssid = "1_rap_extender_2.4G";   // 192.168.10.254
 const char *password = "tank5000";
-const char *HOSTNAME = "link-cam1";     // 시리얼 없이 접속: http://link-cam1.local (또는 공유기 DHCP 목록에서 IP 확인)
+const char *HOSTNAME = "link-cam-test";     // 시리얼 없이 접속: http://link-cam1.local (또는 공유기 DHCP 목록에서 IP 확인)
 
 // Wi-Fi 연결 안정화 (거리가 멀고 사람·장비가 가로막는 현장용)
 //   고정 IP: 처음에 DHCP로 접속한 뒤 후보 주소를 앞에서부터 ARP로 물어보고, 응답이 없는(비어 있는) 첫 주소를 쓴다.
@@ -51,7 +52,7 @@ const IPAddress STATIC_IP_CANDIDATES[] = {
 #define STREAM_MAX_FPS    5             // 웹 영상 스트림 최대 초당 프레임 (약한 신호에서 상태 화면이 멈추지 않게 대역 절약)
 
 #define SLAVE_ID        6
-#define MODBUS_BAUD     9600
+#define MODBUS_BAUD     38400
 // 485 모듈 연결 핀 (UART0, ESP32-CAM 기본 시리얼 핀). 보드 인쇄: U0T = GPIO1, U0R = GPIO3
 #define MB_SERIAL       Serial
 #define MB_TX_PIN       1       // U0T: ESP32 송신 → 485 모듈
