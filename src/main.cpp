@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <stdarg.h>
+#include <new>
 #include "esp_camera.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
@@ -15,6 +16,8 @@
 #include "img_converters.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+
+#define FW_VERSION "2026.11.19-learn"   // 웹 화면·/status에 표시 (장치가 여러 대일 때 어떤 펌웨어인지 구분)
 
 // ==========================================
 // 1. 운용 모드 스위치 (둘 다 켜도 됨)
@@ -36,12 +39,13 @@
 // const char *ssid = "1실습실_2.4G"; 
 const char *ssid = "1_rap_extender_2.4G";   // 192.168.10.254
 const char *password = "tank5000";
-const char *HOSTNAME = "link-cam-test";     // 시리얼 없이 접속: http://link-cam1.local (또는 공유기 DHCP 목록에서 IP 확인)
+const char *HOSTNAME = "link-cam1";     // 시리얼 없이 접속: http://link-cam1.local (또는 공유기 DHCP 목록에서 IP 확인)
 
 // Wi-Fi 연결 안정화 (거리가 멀고 사람·장비가 가로막는 현장용)
 //   고정 IP: 처음에 DHCP로 접속한 뒤 후보 주소를 앞에서부터 ARP로 물어보고, 응답이 없는(비어 있는) 첫 주소를 쓴다.
 //            게이트웨이·서브넷·DNS는 DHCP로 받은 값을 그대로 쓴다. 후보가 모두 사용 중이면 DHCP 주소를 유지한다.
 #define WIFI_STATIC_IP    true          // false = 항상 DHCP
+
 const IPAddress STATIC_IP_CANDIDATES[] = {
   IPAddress(192, 168, 10, 230), IPAddress(192, 168, 10, 231),
   IPAddress(192, 168, 10, 232), IPAddress(192, 168, 10, 233),
@@ -263,6 +267,7 @@ uint16_t detectCount = 0;
 uint32_t frameNo = 0;
 float fps = 0;
 volatile bool relearnRequested = false;
+uint8_t bgVersion = 0;           // 배경 학습에 성공할 때마다 +1 (학습 데이터의 배경 스냅샷 구분용)
 
 // 카메라 상태
 bool cameraOk = false;
@@ -567,6 +572,7 @@ void learnBackground(bool readapt) {
     }
     computePlateStats();
     isBgReady = true;
+    bgVersion++;
   }
   free(acc);
   resetDetectionState();
@@ -991,6 +997,168 @@ static void updateState(const BlobInfo &best, const ColorInfo &ci, const FootChe
 }
 
 // ==========================================
+// 14-1. 학습 데이터 수집 (웹의 크기/색상 학습 버튼)
+// ==========================================
+//   버튼을 누르면 '확정'된 물체의 원본 영상·전경 마스크·측정값을 정답(라벨)과 함께 PSRAM에 저장한다.
+//   판정 기준은 바로 바뀌지 않는다 — 모은 데이터로 보정값을 계산해 펌웨어에 반영하는 용도.
+//   같은 물체(감지 번호가 같음)에 버튼을 또 누르면 새로 찍지 않고 그 샘플의 라벨만 추가/수정한다.
+//   PSRAM은 전원이 꺼지면 지워진다 → 끝나면 /samples.zip 으로 내려받을 것.
+#define SMP_MAX    100
+#define ROI_W      (ROI_X1 - ROI_X0 + 1)   // 120
+#define ROI_H      (ROI_Y1 - ROI_Y0 + 1)   // 90
+#define ROI_N      (ROI_W * ROI_H)
+#define BGSNAP_MAX 8
+const unsigned long BGSNAP_REFRESH_MS = 10UL * 60 * 1000;   // 배경은 조금씩 추적되므로 10분마다 새 스냅샷
+static_assert(ROI_N % 4 == 0, "mask packing");
+
+struct Sample {
+  uint16_t id = 0, det = 0;        // 샘플 번호, 장치 감지 번호(detectCount)
+  uint32_t ms = 0;                 // 저장 시각 (가동 ms)
+  int8_t   bg = -1;                // 배경 스냅샷 번호 (-1 = 없음)
+  uint8_t  sizeLabel = 0, colorLabel = 0;   // 정답 (0 = 미입력)
+  uint8_t  predSize = 0, predColor = 0;     // 장치 판정 = PLC로 보낸 확정 결과
+  float    confRatio = 0;          // 확정에 쓴 평균 비율
+  int16_t  confRgb[3] = {0};
+  uint8_t  frameSize = 0;          // 저장한 프레임 한 장의 비율로 본 크기
+  BlobInfo blob;                   // 저장한 프레임의 덩어리 측정값 (좌표는 전체 화면 기준)
+  ColorInfo color;
+  float    plate[3] = {0}, gain[3] = {0};
+  uint8_t  raw[ROI_N * 2];         // ROI 원본 RGB565 (카메라 바이트 순서: 상위 바이트 먼저)
+  uint8_t  mask[ROI_N / 4];        // 2비트/픽셀: 0 배경, 1 다른 덩어리, 2 선택 덩어리 가장자리, 3 선택 덩어리 내부
+};
+struct BgSnap { uint8_t ver; uint32_t ms; uint8_t *rgb; };   // rgb: ROI_N×3 (R,G,B 순)
+
+Sample *smp[SMP_MAX];
+int smpCount = 0;
+uint16_t smpNextId = 1;
+BgSnap bgSnap[BGSNAP_MAX];
+int bgSnapCount = 0;
+SemaphoreHandle_t smpMutex = nullptr;
+
+// 웹 요청 → 메인 루프 (확정 상태의 프레임에서 저장)
+struct LearnReq {
+  volatile bool pending = false, done = false;
+  char kind = 's';                 // 's' 크기, 'c' 색상
+  uint8_t value = 0;
+  unsigned long deadline = 0;
+  char result[300];
+} learnReq;
+
+static const char SIZE_KEYS[] = "-SML";      // 파일 이름용 (소/중/대)
+static const char COLOR_KEYS[] = "-WKRYGB";  // 흰/검/빨/노/초/파
+
+static int findSample(uint16_t id) {
+  for (int k = 0; k < smpCount; k++) if (smp[k]->id == id) return k;
+  return -1;
+}
+
+// 현재 배경의 스냅샷 번호 (없거나 오래됐으면 새로 저장). 실패하면 가장 최근 것, 그것도 없으면 -1
+static int bgSnapForNow(unsigned long now) {
+  int last = bgSnapCount - 1;
+  if (last >= 0 && bgSnap[last].ver == bgVersion && now - bgSnap[last].ms < BGSNAP_REFRESH_MS) return last;
+  if (bgSnapCount >= BGSNAP_MAX) return last;
+  uint8_t *p = (uint8_t *)heap_caps_malloc(ROI_N * 3, MALLOC_CAP_SPIRAM);
+  if (!p) return last;
+  int k = 0;
+  for (int y = ROI_Y0; y <= ROI_Y1; y++) {
+    for (int x = ROI_X0; x <= ROI_X1; x++) {
+      int i = y * IMG_W + x;
+      p[k++] = bgR[i]; p[k++] = bgG[i]; p[k++] = bgB[i];
+    }
+  }
+  bgSnap[bgSnapCount] = {bgVersion, now, p};
+  return bgSnapCount++;
+}
+
+static void learnFinish(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void learnFinish(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(learnReq.result, sizeof(learnReq.result), fmt, ap);
+  va_end(ap);
+  learnReq.pending = false;
+  learnReq.done = true;
+}
+
+// processFrame() 끝에서 호출: 학습 버튼 요청이 있으면 확정 상태일 때 저장
+static void serviceLearnRequest(const uint8_t *buf, const BlobInfo &best, const ColorInfo &ci) {
+  if (!learnReq.pending) return;
+  unsigned long now = millis();
+  if (detState != ST_CONFIRMED || !best.valid) {
+    static const char *ST_KO[] = {"판 비어 있음", "안정화 중", "확정"};
+    if ((long)(now - learnReq.deadline) > 0) {
+      learnFinish("{\"ok\":false,\"error\":\"물체가 확정되지 않았습니다 (현재: %s%s). 물체를 놓고 초록 사각형이 된 뒤 누르세요\"}",
+                  ST_KO[detState], best.touchesBorder ? ", 분석 영역 경계에 걸침" : "");
+    }
+    return;
+  }
+
+  xSemaphoreTake(smpMutex, portMAX_DELAY);
+  Sample *s = smpCount > 0 ? smp[smpCount - 1] : nullptr;
+  bool merged = s && s->det == detectCount;   // 같은 물체 → 라벨만 추가/수정
+  if (!merged) {
+    if (smpCount >= SMP_MAX) {
+      xSemaphoreGive(smpMutex);
+      learnFinish("{\"ok\":false,\"error\":\"저장 공간이 가득 참 (%d개). ZIP으로 받은 뒤 전체 삭제하세요\"}", SMP_MAX);
+      return;
+    }
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < sizeof(Sample) + 300000) {
+      xSemaphoreGive(smpMutex);
+      learnFinish("{\"ok\":false,\"error\":\"PSRAM 부족. ZIP으로 받은 뒤 전체 삭제하세요\"}");
+      return;
+    }
+    void *mem = heap_caps_malloc(sizeof(Sample), MALLOC_CAP_SPIRAM);
+    if (!mem) {
+      xSemaphoreGive(smpMutex);
+      learnFinish("{\"ok\":false,\"error\":\"메모리 할당 실패\"}");
+      return;
+    }
+    s = new (mem) Sample();
+    s->id = smpNextId++;
+    s->det = detectCount;
+    s->ms = now;
+    s->predSize = curSizeCode;
+    s->predColor = curColorCode;
+    s->confRatio = curRatio;
+    s->confRgb[0] = curR; s->confRgb[1] = curG; s->confRgb[2] = curB;
+    s->frameSize = classifySizeByRatio(best.ratio);
+    s->blob = best;
+    s->color = ci;
+    s->plate[0] = plateR; s->plate[1] = plateG; s->plate[2] = plateB;
+    s->gain[0] = gainR; s->gain[1] = gainG; s->gain[2] = gainB;
+    for (int y = 0; y < ROI_H; y++) {
+      memcpy(s->raw + y * ROI_W * 2, buf + ((y + ROI_Y0) * IMG_W + ROI_X0) * 2, ROI_W * 2);
+      for (int x = 0; x < ROI_W; x++) {
+        uint8_t v = fgMap[(y + ROI_Y0) * IMG_W + x + ROI_X0];
+        uint8_t lv = v == 0 ? 0 : v < 3 ? 1 : v == 3 ? 2 : 3;
+        int k = y * ROI_W + x;
+        s->mask[k >> 2] |= lv << ((k & 3) * 2);
+      }
+    }
+    s->bg = bgSnapForNow(now);
+    smp[smpCount++] = s;
+  }
+  bool isSize = learnReq.kind == 's';
+  uint8_t label = learnReq.value;
+  uint8_t prevLabel = isSize ? s->sizeLabel : s->colorLabel;
+  if (isSize) s->sizeLabel = label; else s->colorLabel = label;
+  uint8_t pred = isSize ? s->predSize : s->predColor;
+  uint16_t id = s->id;
+  float ratio = s->confRatio;
+  int count = smpCount;
+  xSemaphoreGive(smpMutex);
+
+  const char *labelName = isSize ? getSizeName(label) : getColorName(label);
+  const char *predName = isSize ? getSizeName(pred) : getColorName(pred);
+  EVENT("[학습] 샘플 #%u %s 정답 %s / 판별 %s %s (비율 %.2f)%s", id, isSize ? "크기" : "색상", labelName, predName,
+        label == pred ? "O" : "X", ratio, merged ? (prevLabel ? " — 라벨 수정" : " — 같은 물체에 추가") : "");
+  learnFinish("{\"ok\":true,\"id\":%u,\"merged\":%s,\"corrected\":%s,\"kind\":\"%s\",\"label\":%u,\"pred\":%u,"
+              "\"labelName\":\"%s\",\"predName\":\"%s\",\"ratio\":%.3f,\"count\":%d}",
+              id, merged ? "true" : "false", merged && prevLabel ? "true" : "false", isSize ? "size" : "color",
+              label, pred, labelName, predName, ratio, count);
+}
+
+// ==========================================
 // 15. 프레임 분석
 // ==========================================
 void processFrame(camera_fb_t *fb) {
@@ -1071,6 +1239,7 @@ void processFrame(camera_fb_t *fb) {
   // 5단계: 확정된 물체 자리 점검 → 상태 머신 (안정화 → 확정 → 제거/교체)
   lastFoot = detState == ST_CONFIRMED ? checkFootprint(best) : FootCheck();
   updateState(best, ci, lastFoot);
+  if (ENABLE_WEB) serviceLearnRequest(buf, best, ci);
 
   if (ENABLE_WEB) renderDebug(fb, best, ci, fgRawCount, fgCount, components);
 }
@@ -1118,11 +1287,20 @@ a{color:var(--acc)}
 .legend{color:var(--mute);font-size:12px;margin-top:8px}
 .bar{display:inline-block;height:8px;min-width:2px;border-radius:4px;background:var(--warn);vertical-align:middle}
 td.b{width:45%}tr.rec td{background:#16351f}
+.lk{color:var(--mute);font-weight:600;min-width:34px}
+.lrow button{min-width:74px;padding:9px 12px;font-weight:600}
+.dot{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:6px;border:1px solid #666;vertical-align:-1px}
+td.x{color:var(--bad);font-weight:700}td.o{color:var(--ok)}
+.thumbs{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.thumbs img{width:240px;max-width:48%;aspect-ratio:4/3}
+.cm td,.cm th{text-align:center;padding:4px 8px}
+#lnTog{padding:3px 12px;font-size:12px;font-weight:600;border-radius:999px}
+#lnTog.on{background:#1d3a5c;border-color:var(--acc);color:var(--acc)}
 button:disabled{opacity:.5;cursor:wait}
 summary{cursor:pointer;color:var(--mute);font-weight:600;font-size:13px}
 details[open] summary{margin-bottom:10px}
 </style></head><body>
-<header><h1>ESP32-CAM 큐브 판별</h1><span id="mode" class="pill"></span><span id="conn" class="pill">연결 중…</span></header>
+<header><h1>ESP32-CAM 큐브 판별</h1><span id="mode" class="pill"></span><span id="conn" class="pill">연결 중…</span><button id="lnTog" onclick="lnToggle()" title="학습 데이터 수집 영역 보이기/숨기기 (이 브라우저에 기억됨)">학습 모드</button></header>
 <main>
 <section class="card wide">
  <h2>카메라 영상 <span class="sub">왼쪽: 카메라 + 측정 · 오른쪽: 전경 마스크</span></h2>
@@ -1130,6 +1308,21 @@ details[open] summary{margin-bottom:10px}
  <div class="legend">사각형 — 노랑: 안정화 중, 초록: 확정, 빨강: 무효(ROI 경계 접촉). 마스크 — 픽셀별 색 분류, 하늘색: 가장자리(판정 제외), 회색: 다른 덩어리, 진한 빨강: 확정 위치 중 비어 보이는 부분, 어두운 점: 제거된 노이즈</div>
  <div class="row"><button onclick="relearn()">배경 재학습</button>
  <a href="/capture" target="_blank">캡처(JPG)</a><a href="/raw.bmp" target="_blank">원본(BMP)</a><a href="/status" target="_blank">상태(JSON)</a></div>
+</section>
+<section class="card wide" id="lnCard" hidden>
+ <h2>학습 데이터 수집 <span id="lnPill" class="pill">0개</span><span id="lnMem" class="sub"></span></h2>
+ <p class="note" style="margin:0 0 6px">물체를 놓고 <b>초록 사각형(확정)</b>이 되면 정답 버튼을 누르세요. 원본 영상·마스크·측정값이 정답과 함께 장치 메모리에 저장되고, 장치 판정과 비교한 정확도가 아래에 표시됩니다.
+ 같은 물체에 크기·색상 버튼을 모두 누르면 한 샘플에 함께 기록되며, 잘못 누른 버튼은 다시 누르면 고쳐집니다.
+ 판정 기준은 바로 바뀌지 않습니다(모은 데이터로 보정값을 계산해 펌웨어에 반영). <b>전원이 꺼지면 지워지므로</b> 끝나면 ZIP으로 받아 두세요.</p>
+ <div class="row lrow"><span class="lk">크기</span><button onclick="learn('s',1)">소 35</button><button onclick="learn('s',2)">중 55</button><button onclick="learn('s',3)">대 85</button></div>
+ <div class="row lrow" id="lnColors"><span class="lk">색상</span></div>
+ <p class="note" id="lnMsg"></p>
+ <div class="thumbs" id="lnThumbs"></div>
+ <div id="lnAcc"></div>
+ <div class="row"><a href="/samples.zip">ZIP으로 모두 받기</a><button onclick="lnDel('last=1','마지막 샘플을 삭제할까요?')">마지막 샘플 삭제</button><button onclick="lnDel('all=1','저장된 샘플을 모두 삭제할까요? (ZIP으로 받아 두었는지 확인)')">전체 삭제</button></div>
+ <details style="margin-top:10px"><summary>샘플 목록</summary><div class="tbl"><table>
+ <thead><tr><th>#</th><th>크기 정답→판별</th><th>색상 정답→판별</th><th>비율(확정)</th><th>긴변×짧은변</th><th>위치(x,y)</th><th>각도</th><th>영상</th><th></th></tr></thead>
+ <tbody id="lnList"></tbody></table></div></details>
 </section>
 <section class="card">
  <h2>감지된 물체 <span id="state" class="pill"></span></h2>
@@ -1237,10 +1430,12 @@ function render(j){
   ['카메라',cam.ok?`<span class="pill ok">정상</span> ${PIDS[cam.pid]||''} (PID 0x${cam.pid.toString(16).toUpperCase()})`:'<span class="pill bad">초기화 실패</span> 배선/전원 확인 후 재부팅'],
   ['처리 속도',`${j.fps.toFixed(1)} fps · 처리 ${j.frame}프레임`],
   ['프레임 수신',`마지막 ${ago(cam.lastFrameAgo)} · 실패 누적 ${cam.fails}회`],
+  ['펌웨어',j.fw||'(이전 버전)'],
   ['가동 시간',upt(j.uptime)],
   ['여유 메모리',`내부 ${(j.heap/1024).toFixed(0)}KB · PSRAM ${(j.psram/1024).toFixed(0)}KB`],
   ['판(배경)',`RGB(${j.plate.rgb.join(', ')}) · 게인 ${j.plate.gain.join(' / ')}`]]);
  renderWifi(w);
+ lnSamples=j.samples||0;lnTogLabel();
  if($('det').open)$('st').textContent=JSON.stringify(j,null,1);
 }
 // RSSI 등급: -67 이상 양호, -75 이상 보통, 그 아래 약함
@@ -1306,9 +1501,65 @@ async function pollLog(){
  }catch(e){}
  setTimeout(pollLog,1000);
 }
+// ---------- 학습 데이터 수집 ----------
+const SZS=['-','소','중','대'],CLS=['-','흰','검','빨','노','초','파'];
+COLORS.slice(1).forEach((n,i)=>{const b=document.createElement('button');b.innerHTML=`<span class="dot" style="background:${SW[i+1]}"></span>${n.replace('색','')}`;b.onclick=()=>learn('c',i+1);$('lnColors').appendChild(b);});
+// 학습 모드 토글: 기본은 숨김(현장 운용 화면). 켜고 끈 상태는 이 브라우저에 기억된다
+let lnOn=false,lnSamples=0;
+try{lnOn=localStorage.getItem('learnUI')==='1';}catch(e){}
+function lnTogLabel(){const t=$('lnTog');t.classList.toggle('on',lnOn);
+ t.textContent=lnOn?'학습 모드 끄기':(lnSamples>0?`학습 모드 (샘플 ${lnSamples}개)`:'학습 모드');}
+function lnApply(){$('lnCard').hidden=!lnOn;lnTogLabel();if(lnOn)lnLoad();}
+function lnToggle(){lnOn=!lnOn;try{localStorage.setItem('learnUI',lnOn?'1':'0');}catch(e){}lnApply();}
+let lnBusy=false;
+function lnButtons(dis){document.querySelectorAll('.lrow button').forEach(b=>b.disabled=dis);}
+async function learn(k,v){
+ if(lnBusy)return;lnBusy=true;lnButtons(true);
+ $('lnMsg').textContent=`저장 중… (${k=='s'?SIZES[v]:COLORS[v]}) — 물체가 확정될 때까지 최대 5초 기다립니다`;
+ try{
+  const j=await(await fetch(`/learn?${k}=${v}`,{cache:'no-store'})).json();
+  if(!j.ok){$('lnMsg').innerHTML=`<span class="pill bad">저장 안 됨</span> ${j.error}`;}
+  else{
+   const m=j.label==j.pred;
+   $('lnMsg').innerHTML=`<span class="pill ${m?'ok':'bad'}">${m?'판별 일치':'판별 틀림'}</span> 샘플 #${j.id} ${j.kind=='size'?'크기':'색상'} 정답 <b>${j.labelName}</b> / 장치 판별 <b>${j.predName}</b> · 비율 ${j.ratio.toFixed(2)}`+
+    (j.corrected?' · 라벨을 고쳤습니다':j.merged?' · 같은 물체 샘플에 추가':'')+` · 저장 ${j.count}개`;
+   $('lnThumbs').innerHTML=`<img src="/sample.bmp?id=${j.id}&k=raw" alt="원본"><img src="/sample.bmp?id=${j.id}&k=mask" alt="마스크">`;
+  }
+ }catch(e){$('lnMsg').textContent='저장 실패 (장치 응답 없음)';}
+ lnBusy=false;lnButtons(false);lnLoad();
+}
+async function lnDel(q,msg){
+ if(!confirm(msg))return;
+ try{const j=await(await fetch('/sample_del?'+q,{cache:'no-store'})).json();$('lnMsg').textContent=`${j.removed}개 삭제 · 남은 샘플 ${j.count}개`;$('lnThumbs').innerHTML='';}catch(e){}
+ lnLoad();
+}
+function cmTable(rows,names,lab,pred){   // 혼동표: 행=정답, 열=판별
+ let h=`<table class="cm"><thead><tr><th>정답＼판별</th>${names.map(n=>`<th>${n}</th>`).join('')}</tr></thead><tbody>`;
+ for(let a=1;a<names.length;a++){const r=rows.filter(s=>s[lab]==a);if(!r.length)continue;
+  h+=`<tr><th>${names[a]}</th>`+names.map((_,p)=>{const n=r.filter(s=>s[pred]==p).length;return `<td class="${n?(p==a?'o':'x'):''}">${n||''}</td>`;}).join('')+'</tr>';}
+ return h+'</tbody></table>';
+}
+async function lnLoad(){
+ try{
+  const j=await(await fetch('/samples',{cache:'no-store'})).json(),S=j.samples;
+  pill($('lnPill'),`${j.count}/${j.max}개`,j.count?'ok':'');
+  $('lnMem').textContent=`PSRAM 여유 ${(j.psramFree/1024).toFixed(0)}KB`;
+  const sz=S.filter(s=>s.size),co=S.filter(s=>s.color);
+  const acc=(a,f)=>a.length?`${a.filter(f).length}/${a.length} (${Math.round(a.filter(f).length/a.length*100)}%)`:'-';
+  let h=`<dl class="kv" style="margin-top:8px"><dt>크기 정확도</dt><dd>${acc(sz,s=>s.size==s.predSize)}</dd><dt>색상 정확도</dt><dd>${acc(co,s=>s.color==s.predColor)}</dd></dl>`;
+  h+='<div class="row" style="align-items:flex-start">';
+  if(sz.length)h+=`<div class="tbl">${cmTable(sz,['미판별','소','중','대'],'size','predSize')}</div>`;
+  if(co.length)h+=`<div class="tbl">${cmTable(co,['미판별','흰','검','빨','노','초','파'],'color','predColor')}</div>`;
+  $('lnAcc').innerHTML=h+'</div>';
+  $('lnList').innerHTML=S.slice().reverse().map(s=>{
+   const c1=s.size?(s.size==s.predSize?'o':'x'):'',c2=s.color?(s.color==s.predColor?'o':'x'):'';
+   return `<tr><td>${s.id}</td><td class="${c1}">${SZS[s.size]}→${SZS[s.predSize]}</td><td class="${c2}">${CLS[s.color]}→${CLS[s.predColor]}</td><td>${s.confRatio.toFixed(2)}</td><td>${s.len.toFixed(1)}×${s.wid.toFixed(1)}</td><td>${s.cx.toFixed(0)}, ${s.cy.toFixed(0)}</td><td>${s.angle.toFixed(0)}°</td>`+
+    `<td><a href="/sample.bmp?id=${s.id}&k=raw" target="_blank">원본</a> <a href="/sample.bmp?id=${s.id}&k=mask" target="_blank">마스크</a></td><td><button onclick="lnDel('id=${s.id}','샘플 #${s.id}을 삭제할까요?')">삭제</button></td></tr>`;}).join('');
+ }catch(e){}
+}
 function relearn(){if(!confirm('판 위의 물체를 모두 치웠나요? 배경을 다시 학습합니다.'))return;fetch('/relearn').then(r=>r.text()).then(t=>alert(t));}
 $('s').src='http://'+location.hostname+':81/stream';
-pollStatus();pollLog();
+pollStatus();pollLog();lnApply();setInterval(()=>{if(lnOn)lnLoad();},10000);
 </script></body></html>)rawliteral";
 
 static esp_err_t index_handler(httpd_req_t *req) {
@@ -1393,10 +1644,10 @@ static esp_err_t status_handler(httpd_req_t *req) {
   unsigned long now = millis();
   unsigned long lastFrame = lastFrameMs;
   n = jsonAppend(json, cap, n,
-    ",\"uptime\":%lu,\"heap\":%u,\"psram\":%u,"
+    ",\"fw\":\"" FW_VERSION "\",\"samples\":%d,\"uptime\":%lu,\"heap\":%u,\"psram\":%u,"
     "\"camera\":{\"ok\":%s,\"pid\":%u,\"fails\":%lu,\"lastFrameAgo\":%ld},"
     "\"wifi\":{\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"host\":\"%s\"",
-    now, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(),
+    smpCount, now, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(),
     cameraOk ? "true" : "false", (unsigned)camPid, (unsigned long)camFails,
     lastFrame ? (long)(now - lastFrame) : -1L,
     ssid, WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(), HOSTNAME);
@@ -1547,6 +1798,339 @@ static esp_err_t wifiscan_handler(httpd_req_t *req) {
   return res;
 }
 
+// ---------- 학습 데이터: 웹 처리 ----------
+
+static inline void wr16(uint8_t *p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
+static inline void wr32(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+
+static int queryInt(httpd_req_t *req, const char *key, int def) {
+  char q[64], v[16];
+  if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK) return def;
+  if (httpd_query_key_value(q, key, v, sizeof(v)) != ESP_OK) return def;
+  return atoi(v);
+}
+
+// BMP 헤더 (아래→위 행 순서, 행 길이는 4바이트 배수). 반환: 픽셀 데이터 시작 위치
+static size_t bmpHeader(uint8_t *p, int w, int h, int bpp, int paletteN) {
+  int row = ((w * bpp / 8) + 3) & ~3;
+  uint32_t off = 14 + 40 + paletteN * 4;
+  memset(p, 0, off);
+  p[0] = 'B'; p[1] = 'M';
+  wr32(p + 2, off + row * h); wr32(p + 10, off);
+  wr32(p + 14, 40); wr32(p + 18, w); wr32(p + 22, h); wr16(p + 26, 1); wr16(p + 28, bpp);
+  wr32(p + 34, row * h); wr32(p + 38, 2835); wr32(p + 42, 2835); wr32(p + 46, paletteN);
+  return off;
+}
+#define BMP24_LEN (54 + ROI_W * 3 * ROI_H)
+#define BMP8_LEN  (54 + 256 * 4 + ROI_W * ROI_H)
+static_assert((ROI_W * 3) % 4 == 0 && ROI_W % 4 == 0, "BMP rows must not need padding");
+
+// 원본 RGB565 → 24비트 BMP
+static size_t bmpFromRaw(uint8_t *out, const uint8_t *raw) {
+  size_t o = bmpHeader(out, ROI_W, ROI_H, 24, 0);
+  for (int y = ROI_H - 1; y >= 0; y--) {
+    for (int x = 0; x < ROI_W; x++) {
+      int r, g, b;
+      readPx(raw, y * ROI_W + x, r, g, b);
+      out[o++] = b; out[o++] = g; out[o++] = r;
+    }
+  }
+  return o;
+}
+// 배경 스냅샷(R,G,B) → 24비트 BMP
+static size_t bmpFromRgb(uint8_t *out, const uint8_t *rgb) {
+  size_t o = bmpHeader(out, ROI_W, ROI_H, 24, 0);
+  for (int y = ROI_H - 1; y >= 0; y--) {
+    const uint8_t *p = rgb + y * ROI_W * 3;
+    for (int x = 0; x < ROI_W; x++, p += 3) { out[o++] = p[2]; out[o++] = p[1]; out[o++] = p[0]; }
+  }
+  return o;
+}
+// 마스크 → 8비트 팔레트 BMP (픽셀 값 = 마스크 단계 0~3)
+static size_t bmpFromMask(uint8_t *out, const uint8_t *mask) {
+  size_t o = bmpHeader(out, ROI_W, ROI_H, 8, 256);
+  static const uint8_t PAL[4][3] = {{0, 0, 0}, {90, 90, 90}, {255, 160, 0}, {255, 255, 255}};   // R,G,B
+  for (int k = 0; k < 4; k++) { out[54 + k * 4] = PAL[k][2]; out[55 + k * 4] = PAL[k][1]; out[56 + k * 4] = PAL[k][0]; }
+  for (int y = ROI_H - 1; y >= 0; y--) {
+    for (int x = 0; x < ROI_W; x++) {
+      int k = y * ROI_W + x;
+      out[o++] = (mask[k >> 2] >> ((k & 3) * 2)) & 3;
+    }
+  }
+  return o;
+}
+
+static void sampleFileName(char *out, size_t cap, const Sample *s, const char *kind) {
+  snprintf(out, cap, "s%03u_%c_%c_%s.bmp", s->id, SIZE_KEYS[s->sizeLabel], COLOR_KEYS[s->colorLabel], kind);
+}
+
+// 샘플 한 개의 JSON (full = ZIP용 전체 항목)
+static size_t sampleJson(char *o, size_t cap, const Sample *s, bool full) {
+  const BlobInfo &b = s->blob;
+  size_t n = snprintf(o, cap,
+    "{\"id\":%u,\"det\":%u,\"ms\":%lu,\"size\":%u,\"color\":%u,\"predSize\":%u,\"predColor\":%u,\"confRatio\":%.3f,"
+    "\"frameSize\":%u,\"area\":%d,\"cx\":%.2f,\"cy\":%.2f,\"len\":%.2f,\"wid\":%.2f,\"ratio\":%.3f,\"angle\":%.1f",
+    s->id, s->det, (unsigned long)s->ms, s->sizeLabel, s->colorLabel, s->predSize, s->predColor, s->confRatio,
+    s->frameSize, b.area, b.cx, b.cy, b.len, b.wid, b.ratio, b.angleDeg);
+  if (full && n < cap) {
+    const ColorInfo &c = s->color;
+    char fr[40], fm[40];
+    sampleFileName(fr, sizeof(fr), s, "raw");
+    sampleFileName(fm, sizeof(fm), s, "mask");
+    n += snprintf(o + n, cap - n,
+      ",\"bbox\":[%d,%d,%d,%d],\"touchesBorder\":%s,\"frameColor\":%u,\"rgb\":[%d,%d,%d],\"confRgb\":[%d,%d,%d],"
+      "\"colorSamples\":%d,\"chromaShare\":%.3f,\"vRatio\":%.3f,\"votes\":[%d,%d,%d,%d,%d,%d,%d],"
+      "\"plate\":[%.1f,%.1f,%.1f],\"gain\":[%.3f,%.3f,%.3f],\"bg\":%d,\"raw\":\"%s\",\"mask\":\"%s\"",
+      b.minX, b.minY, b.maxX, b.maxY, b.touchesBorder ? "true" : "false", c.code, c.r, c.g, c.b,
+      s->confRgb[0], s->confRgb[1], s->confRgb[2], c.samples, c.chromaShare, c.vRatio,
+      c.votes[1], c.votes[2], c.votes[3], c.votes[4], c.votes[5], c.votes[6], c.votes[7],
+      s->plate[0], s->plate[1], s->plate[2], s->gain[0], s->gain[1], s->gain[2], s->bg, fr, fm);
+  }
+  if (n < cap) n += snprintf(o + n, cap - n, "}");
+  return n;
+}
+
+// 전체 메타데이터 + 샘플 목록 JSON (PSRAM 버퍼를 할당해 반환, 호출자가 free)
+static char *samplesJson(bool full, size_t *outLen) {
+  size_t cap = 2048 + (size_t)SMP_MAX * (full ? 760 : 330);
+  char *o = (char *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+  if (!o) return nullptr;
+  xSemaphoreTake(smpMutex, portMAX_DELAY);
+  size_t n = snprintf(o, cap,
+    "{\"fw\":\"%s\",\"host\":\"%s\",\"count\":%d,\"max\":%d,\"psramFree\":%u,"
+    "\"img\":[%d,%d],\"roi\":[%d,%d,%d,%d],\"ratioSmallMax\":%.2f,\"ratioMediumMax\":%.2f,"
+    "\"sizeNames\":[\"미입력\",\"소(35mm)\",\"중(55mm)\",\"대(85mm)\"],"
+    "\"colorNames\":[\"미입력\",\"흰색\",\"검정색\",\"빨간색\",\"노란색\",\"초록색\",\"파란색\"],"
+    "\"maskLevels\":\"0 배경, 1 다른 덩어리, 2 선택 덩어리 가장자리, 3 선택 덩어리 내부\",\"backgrounds\":[",
+    FW_VERSION, HOSTNAME, smpCount, SMP_MAX, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+    IMG_W, IMG_H, ROI_X0, ROI_Y0, ROI_X1, ROI_Y1, RATIO_SMALL_MAX, RATIO_MEDIUM_MAX);
+  for (int k = 0; k < bgSnapCount && n < cap; k++)
+    n += snprintf(o + n, cap - n, "%s{\"bg\":%d,\"ver\":%u,\"ms\":%lu,\"file\":\"bg%d.bmp\"}", k ? "," : "", k,
+                  bgSnap[k].ver, (unsigned long)bgSnap[k].ms, k);
+  if (n < cap) n += snprintf(o + n, cap - n, "],\"samples\":[");
+  for (int k = 0; k < smpCount && n < cap; k++) {
+    if (k && n < cap) o[n++] = ',';
+    n += sampleJson(o + n, cap - n, smp[k], full);
+  }
+  xSemaphoreGive(smpMutex);
+  if (n < cap) n += snprintf(o + n, cap - n, "]}");
+  if (n >= cap) { free(o); return nullptr; }
+  *outLen = n;
+  return o;
+}
+
+// /learn?s=1..3 (크기) 또는 /learn?c=1..6 (색상): 메인 루프가 확정 상태 프레임에서 저장할 때까지 기다린다
+static esp_err_t learn_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  int s = queryInt(req, "s", 0), c = queryInt(req, "c", 0);
+  char kind = s ? 's' : 'c';
+  int val = s ? s : c;
+  if ((s && (s < 1 || s > 3)) || (!s && (c < 1 || c > 6))) return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"잘못된 요청\"}");
+  if (!cameraOk) return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"카메라 초기화 실패 상태\"}");
+  if (learnReq.pending) return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"이전 요청 처리 중\"}");
+  learnReq.kind = kind;
+  learnReq.value = val;
+  learnReq.deadline = millis() + 5000;     // 5초 안에 확정 상태가 되면 저장
+  learnReq.done = false;
+  learnReq.pending = true;
+  unsigned long t0 = millis();
+  while (!learnReq.done && millis() - t0 < 7000) vTaskDelay(pdMS_TO_TICKS(30));
+  if (!learnReq.done) {
+    learnReq.pending = false;
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"장치 응답 시간 초과 (배경 학습 중일 수 있음)\"}");
+  }
+  return httpd_resp_sendstr(req, learnReq.result);
+}
+
+// /samples : 메타데이터 + 샘플 목록 (웹 화면용)
+static esp_err_t samples_handler(httpd_req_t *req) {
+  size_t len = 0;
+  char *j = samplesJson(false, &len);
+  if (!j) return httpd_resp_send_500(req);
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  esp_err_t r = httpd_resp_send(req, j, len);
+  free(j);
+  return r;
+}
+
+// /sample.bmp?id=N&k=raw|mask  또는  /sample.bmp?bg=K
+static esp_err_t sample_bmp_handler(httpd_req_t *req) {
+  char q[64], k[8] = "raw";
+  if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) httpd_query_key_value(q, "k", k, sizeof(k));
+  int id = queryInt(req, "id", -1), bg = queryInt(req, "bg", -1);
+  bool isMask = strcmp(k, "mask") == 0;
+  uint8_t *out = (uint8_t *)heap_caps_malloc(BMP24_LEN > BMP8_LEN ? BMP24_LEN : BMP8_LEN, MALLOC_CAP_SPIRAM);
+  if (!out) return httpd_resp_send_500(req);
+  size_t len = 0;
+  xSemaphoreTake(smpMutex, portMAX_DELAY);
+  if (bg >= 0 && bg < bgSnapCount) {
+    len = bmpFromRgb(out, bgSnap[bg].rgb);
+  } else if (id >= 0) {
+    int i = findSample(id);
+    if (i >= 0) len = isMask ? bmpFromMask(out, smp[i]->mask) : bmpFromRaw(out, smp[i]->raw);
+  }
+  xSemaphoreGive(smpMutex);
+  esp_err_t r;
+  if (!len) {
+    httpd_resp_set_status(req, "404 Not Found");
+    r = httpd_resp_sendstr(req, "샘플 없음");
+  } else {
+    httpd_resp_set_type(req, "image/bmp");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    r = httpd_resp_send(req, (const char *)out, len);
+  }
+  free(out);
+  return r;
+}
+
+// /sample_del?id=N | ?last=1 | ?all=1
+static esp_err_t sample_del_handler(httpd_req_t *req) {
+  int id = queryInt(req, "id", -1), last = queryInt(req, "last", 0), all = queryInt(req, "all", 0);
+  int removed = 0;
+  xSemaphoreTake(smpMutex, portMAX_DELAY);
+  if (all) {
+    for (int k = 0; k < smpCount; k++) free(smp[k]);
+    removed = smpCount;
+    smpCount = 0;
+    for (int k = 0; k < bgSnapCount; k++) free(bgSnap[k].rgb);
+    bgSnapCount = 0;
+  } else {
+    int i = last ? smpCount - 1 : findSample(id);
+    if (i >= 0) {
+      free(smp[i]);
+      for (int k = i; k < smpCount - 1; k++) smp[k] = smp[k + 1];
+      smpCount--;
+      removed = 1;
+    }
+  }
+  int left = smpCount;
+  xSemaphoreGive(smpMutex);
+  if (removed) EVENT("[학습] 샘플 %d개 삭제 (남은 샘플 %d개)", removed, left);
+  char r[64];
+  snprintf(r, sizeof(r), "{\"ok\":true,\"removed\":%d,\"count\":%d}", removed, left);
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  return httpd_resp_sendstr(req, r);
+}
+
+// ZIP(무압축) 스트리밍: 파일마다 CRC를 먼저 계산할 수 있도록 메모리에서 만든 뒤 보낸다
+static uint32_t crc32buf(const uint8_t *d, size_t n) {
+  static uint32_t table[256];
+  static bool ready = false;
+  if (!ready) {
+    for (uint32_t i = 0; i < 256; i++) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+      table[i] = c;
+    }
+    ready = true;
+  }
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; i++) c = table[(c ^ d[i]) & 0xFF] ^ (c >> 8);
+  return c ^ 0xFFFFFFFFu;
+}
+
+struct ZipOut {
+  struct Ent { char name[40]; uint32_t crc, size, off; };
+  httpd_req_t *req;
+  Ent *ents;
+  int n = 0, cap;
+  uint32_t off = 0;
+  esp_err_t err = ESP_OK;
+  void send(const void *p, size_t len) {
+    if (err == ESP_OK && len) err = httpd_resp_send_chunk(req, (const char *)p, len);
+    off += len;
+  }
+  void add(const char *name, const uint8_t *data, uint32_t len) {
+    if (err != ESP_OK || n >= cap) return;
+    Ent &e = ents[n++];
+    strlcpy(e.name, name, sizeof(e.name));
+    e.crc = crc32buf(data, len);
+    e.size = len;
+    e.off = off;
+    uint16_t nl = strlen(e.name);
+    uint8_t h[30] = {0};
+    wr32(h, 0x04034b50); wr16(h + 4, 10); wr16(h + 12, 0x0021);   // 버전 1.0, 무압축, 날짜 1980-01-01
+    wr32(h + 14, e.crc); wr32(h + 18, len); wr32(h + 22, len); wr16(h + 26, nl);
+    send(h, 30);
+    send(e.name, nl);
+    for (uint32_t k = 0; k < len; k += 8192) send(data + k, len - k < 8192 ? len - k : 8192);
+  }
+  void finish() {
+    uint32_t cdOff = off;
+    for (int k = 0; k < n; k++) {
+      uint8_t c[46] = {0};
+      uint16_t nl = strlen(ents[k].name);
+      wr32(c, 0x02014b50); wr16(c + 4, 20); wr16(c + 6, 10); wr16(c + 14, 0x0021);
+      wr32(c + 16, ents[k].crc); wr32(c + 20, ents[k].size); wr32(c + 24, ents[k].size); wr16(c + 28, nl);
+      wr32(c + 42, ents[k].off);
+      send(c, 46);
+      send(ents[k].name, nl);
+    }
+    uint8_t z[22] = {0};
+    wr32(z, 0x06054b50); wr16(z + 8, n); wr16(z + 10, n); wr32(z + 12, off - cdOff); wr32(z + 16, cdOff);
+    send(z, 22);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, NULL, 0);
+  }
+};
+
+// /samples.zip : samples.json + 샘플별 원본/마스크 BMP + 배경 BMP
+static esp_err_t samples_zip_handler(httpd_req_t *req) {
+  size_t jlen = 0;
+  char *json = samplesJson(true, &jlen);
+  uint8_t *bmp = (uint8_t *)heap_caps_malloc(BMP24_LEN > BMP8_LEN ? BMP24_LEN : BMP8_LEN, MALLOC_CAP_SPIRAM);
+  ZipOut z;
+  z.req = req;
+  z.cap = 2 * SMP_MAX + BGSNAP_MAX + 1;
+  z.ents = (ZipOut::Ent *)heap_caps_malloc(sizeof(ZipOut::Ent) * z.cap, MALLOC_CAP_SPIRAM);
+  if (!json || !bmp || !z.ents) {
+    free(json); free(bmp); free(z.ents);
+    return httpd_resp_send_500(req);
+  }
+  char disp[80];
+  snprintf(disp, sizeof(disp), "attachment; filename=\"%s_samples.zip\"", HOSTNAME);
+  httpd_resp_set_type(req, "application/zip");
+  httpd_resp_set_hdr(req, "Content-Disposition", disp);
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  z.add("samples.json", (const uint8_t *)json, jlen);
+  free(json);
+
+  // 목록을 먼저 복사해 두고, 파일마다 잠깐씩만 잠근다 (그사이 삭제된 샘플은 건너뜀)
+  uint16_t ids[SMP_MAX];
+  xSemaphoreTake(smpMutex, portMAX_DELAY);
+  int cnt = smpCount, bgs = bgSnapCount;
+  for (int k = 0; k < cnt; k++) ids[k] = smp[k]->id;
+  xSemaphoreGive(smpMutex);
+
+  char name[40];
+  for (int k = 0; k < bgs && z.err == ESP_OK; k++) {
+    xSemaphoreTake(smpMutex, portMAX_DELAY);
+    size_t len = k < bgSnapCount ? bmpFromRgb(bmp, bgSnap[k].rgb) : 0;
+    xSemaphoreGive(smpMutex);
+    snprintf(name, sizeof(name), "bg%d.bmp", k);
+    if (len) z.add(name, bmp, len);
+  }
+  for (int k = 0; k < cnt && z.err == ESP_OK; k++) {
+    for (int part = 0; part < 2; part++) {
+      xSemaphoreTake(smpMutex, portMAX_DELAY);
+      int i = findSample(ids[k]);
+      size_t len = 0;
+      if (i >= 0) {
+        len = part == 0 ? bmpFromRaw(bmp, smp[i]->raw) : bmpFromMask(bmp, smp[i]->mask);
+        sampleFileName(name, sizeof(name), smp[i], part == 0 ? "raw" : "mask");
+      }
+      xSemaphoreGive(smpMutex);
+      if (len) z.add(name, bmp, len);
+    }
+  }
+  z.finish();
+  free(bmp);
+  free(z.ents);
+  return z.err;
+}
+
 void startWebServers() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
@@ -1559,7 +2143,13 @@ void startWebServers() {
     {.uri = "/raw.bmp", .method = HTTP_GET, .handler = raw_bmp_handler, .user_ctx = NULL},
     {.uri = "/relearn", .method = HTTP_GET, .handler = relearn_handler, .user_ctx = NULL},
     {.uri = "/wifiscan", .method = HTTP_GET, .handler = wifiscan_handler, .user_ctx = NULL},
+    {.uri = "/learn", .method = HTTP_GET, .handler = learn_handler, .user_ctx = NULL},
+    {.uri = "/samples", .method = HTTP_GET, .handler = samples_handler, .user_ctx = NULL},
+    {.uri = "/sample.bmp", .method = HTTP_GET, .handler = sample_bmp_handler, .user_ctx = NULL},
+    {.uri = "/sample_del", .method = HTTP_GET, .handler = sample_del_handler, .user_ctx = NULL},
+    {.uri = "/samples.zip", .method = HTTP_GET, .handler = samples_zip_handler, .user_ctx = NULL},
   };
+  config.max_uri_handlers = 16;
   if (httpd_start(&web_httpd, &config) == ESP_OK) {
     for (auto &u : uris) httpd_register_uri_handler(web_httpd, &u);
   }
@@ -1780,6 +2370,7 @@ static void networkTask() {
 void setup() {
   if (SERIAL_LOG) Serial.begin(115200);
   evtMutex = xSemaphoreCreateMutex();
+  smpMutex = xSemaphoreCreateMutex();
 
   camera_config_t config = {};   // 미설정 필드(fb_location 등)가 쓰레기값이 되지 않도록 0 초기화
   config.ledc_channel = LEDC_CHANNEL_0;
