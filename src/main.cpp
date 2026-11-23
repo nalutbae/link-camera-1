@@ -17,7 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-#define FW_VERSION "2026.11.19-learn"   // 웹 화면·/status에 표시 (장치가 여러 대일 때 어떤 펌웨어인지 구분)
+#define FW_VERSION "2026.11.20-size"    // 웹 화면·/status에 표시 (장치가 여러 대일 때 어떤 펌웨어인지 구분)
 
 // ==========================================
 // 1. 운용 모드 스위치 (둘 다 켜도 됨)
@@ -76,7 +76,7 @@ const unsigned long MB_LINK_TIMEOUT_MS = 5000;   // 이 시간 동안 요청이 
 #define REG_G_VAL       4       // 40005: G 값
 #define REG_B_VAL       5       // 40006: B 값
 #define REG_DETECT_CNT  6       // 40007: 새 물체 감지 누적 횟수
-#define REG_RATIO_X100  7       // 40008: 긴변/짧은변 비율 x 100 (예: 157 = 1.57배)
+#define REG_RATIO_X100  7       // 40008: 길이비 x 100 = 추정 길이 ÷ 35mm (예: 157 = 약 55mm). 소≈100, 중≈157, 대≈243
 #define REG_COMMAND     8       // 40009: 명령. PLC가 1을 쓰면 배경 재학습 → 진행 중 2 → 완료 0
 #define REG_COUNT       9
 
@@ -112,13 +112,31 @@ const int  SHADOW_MIN_PCT    = 50;   // 배경 밝기의 50~100% 이면서 무�
 const int MIN_BLOB_AREA = 150;       // 물체로 인정할 최소 덩어리 면적(px). 소형 큐브 ≈ 20x20 = 400px
 // 가장 큰 덩어리가 MIN_BLOB_AREA/2 보다 작으면 '빈 판'으로 본다
 
+// 검정 물체 보강
+//   3D 프린팅 면이 빛을 반사해 검정 윗면이 판 밝기의 50~80%(회색)로 찍히면 위의 그림자 필터에 지워져
+//   물체가 일부(진한 옆면·모서리)만 잡힌다. 검정으로 판정된 덩어리에는 그림자 필터 없이 다시 본 전경 중
+//   '같은 열(좌우 BLACK_GROW_COLS 안)에서 덩어리 바닥보다 위'인 픽셀만 붙인다.
+//   카메라 쪽 옆면은 빛을 못 받아 늘 진하게 잡히므로, 그보다 아래(카메라 쪽)에 생기는 진짜 그림자는 붙지 않는다.
+const int BLACK_GROW_COLS = 8;
+
 // ==========================================
-// 5. 크기 판별 (회전 무관, 2차 모멘트 기반 긴변/짧은변)
+// 5. 크기 판별 — 원근 보정 + 옆면 제거 + 최소 외접 사각형
 // ==========================================
-//   이론값: 소(35/35=1.00), 중(55/35=1.57), 대(85/35=2.43)
-//   판 중심에서 먼 물체는 옆면(높이 35mm)이 같이 보여 비율이 ±0.2 정도 흔들림
-const float RATIO_SMALL_MAX  = 1.30f; // < 1.30 → 소 (35mm)
-const float RATIO_MEDIUM_MAX = 1.95f; // 1.30~1.95 → 중 (55mm), > 1.95 → 대 (85mm)
+//  학습 샘플 30개(흰·빨·검 × 소·중·대, 여러 위치·방향)로 맞춘 값. 다시 맞추기: tools/size_check.py
+//  카메라가 비스듬히 내려다보기 때문에
+//   (1) 세로가 가로보다 짧게, 판 안쪽(화면 위)일수록 작게 찍힌다 → '원근 보정 좌표'로 바꿔서 잰다
+//   (2) 카메라 쪽 옆면(높이 35mm)이 물체 아래쪽에 붙어 보인다 (흰색은 옆면이 판과 비슷한 회색이라 안 잡힘)
+//       → 여러 방향의 폭에서 옆면이 늘린 만큼(아래 방향 성분)을 빼고, 가장 작은 외접 사각형 = 윗면으로 본다
+//  예전 방식(긴변/짧은변 비율)은 옆면 때문에 가로로 놓인 중형을 소형으로, 비스듬한 대형을 중형으로 봤다.
+//  샘플 측정 길이: 소 34~44mm, 중 50~56mm, 대 62~87mm → 경계는 그 사이
+const float SIZE_PERSP_P       = 0.00203f; // 원근: 행 y의 확대율 g = 1 / (1 + P·(y - 60))
+const float SIZE_Y_SCALE       = 1.1432f;  // 세로 축척 (기울어져서 세로가 짧게 찍힘)
+const float SIZE_PX_PER_35MM   = 31.48f;   // 보정 좌표에서 35mm(단면 폭)의 길이
+const float SIDE_FACE_PX       = 10.0f;    // 옆면이 같이 잡히는 물체(흰색 외)의 옆면 두께 (보정 좌표)
+const float SIZE_SMALL_MAX_MM  = 47.0f;    // 추정 길이 < 47mm → 소(35mm)
+const float SIZE_MEDIUM_MAX_MM = 58.5f;    // 47~58.5mm → 중(55mm), 그 이상 → 대(85mm)
+const float SIZE_RECHECK_MM    = 3.0f;     // 확정 후 길이가 경계를 이만큼 넘어 다르게 보이면 다시 판정
+const int   SIZE_CALIPER_STEP  = 3;        // 외접 사각형을 찾는 각도 간격(도)
 
 // ==========================================
 // 6. 색상 판별 (판 기준 화이트밸런스 + 픽셀 투표)
@@ -126,7 +144,8 @@ const float RATIO_MEDIUM_MAX = 1.95f; // 1.30~1.95 → 중 (55mm), > 1.95 → �
 const int   PX_CHROMA_MIN     = 25;    // 유채색 픽셀: 최대-최소 ≥ 25
 const float PX_SAT_MIN        = 0.28f; //              그리고 채도(S) ≥ 0.28
 const float CHROMA_SHARE_MIN  = 0.35f; // 내부 픽셀 중 유채색이 35% 이상이면 유채색 물체
-const float WHITE_BLACK_SPLIT = 0.65f; // 무채색 물체: (평균 밝기 / 판 밝기) ≥ 0.65 → 흰색, 미만 → 검정
+const float WHITE_BLACK_SPLIT = 1.2f;  // 무채색 물체: (평균 밝기 / 판 밝기) ≥ 1.2 → 흰색, 미만 → 검정
+                                       //   샘플: 흰 2.3~2.6, 검 0.44~0.66 (반사로 회색이 된 검정 윗면 때문에 0.65는 너무 높았음)
 // 색상각(Hue) 경계
 const float HUE_RED_FROM   = 335.0f;   // 335~360, 0~28 → 빨강
 const float HUE_YELLOW_FROM = 28.0f;   // 28~68 → 노랑
@@ -199,9 +218,11 @@ float gainR = 1, gainG = 1, gainB = 1;
 int gainR8 = 256, gainG8 = 256, gainB8 = 256;   // 고정소수점(x256) 게인 — 픽셀 루프용
 
 // 작업 버퍼 (PSRAM)
-uint8_t  *fgRaw = nullptr;   // 0/1 원시 전경
-uint8_t  *fgMap = nullptr;   // 0:배경 1:전경 2:다른 덩어리 3:선택 덩어리 가장자리 10+n:선택 덩어리 내부(n=픽셀 분류)
+uint8_t  *fgRaw = nullptr;   // 원시 전경 비트: 1 = 전경(그림자 필터 적용), 2 = 그림자 필터 없이 본 전경 (검정 보강용)
+uint8_t  *fgMap = nullptr;   // 0:배경 1:전경 2:다른 덩어리 3:선택 덩어리 가장자리 4:검정 보강 10+n:선택 덩어리 내부(n=픽셀 분류)
 uint16_t *bfsQueue = nullptr;
+uint8_t  *measMask = nullptr;   // 크기 측정용 마스크 (선택 덩어리 + 검정 보강 → 열림 → 가장 큰 덩어리)
+uint8_t  *measTmp = nullptr;
 
 struct BlobInfo {
   int   area = 0;
@@ -210,9 +231,13 @@ struct BlobInfo {
   bool  touchesBorder = false;
   bool  valid = false;           // 면적 충분 + ROI 경계 미접촉
   float cx = 0, cy = 0;          // 중심
-  float len = 0, wid = 0;        // 긴변/짧은변 (px)
-  float ratio = 0;               // len / wid
+  float len = 0, wid = 0;        // 2차 모멘트 긴변/짧은변 (px, 화면 그대로 — 참고용)
+  float ratio = 0;               // len / wid (참고용, 크기 판별에는 쓰지 않음)
   float angleDeg = 0;            // 긴변 방향
+  float lenMm = 0, widMm = 0;    // 원근·옆면 보정 후 윗면 크기 추정 (mm) — 크기 판별 기준
+  float boxX[4] = {0}, boxY[4] = {0};   // 추정 윗면 사각형 꼭짓점 (화면 좌표, 디버그 표시용)
+  int   grown = 0;               // 검정 보강으로 붙인 픽셀 수
+  bool  sideCut = false;         // 옆면 보정 적용 여부 (흰색 외)
   int64_t sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
 };
 
@@ -254,14 +279,16 @@ BlobInfo changePrev;
 int   accColorVotes[8];
 long  accRgb[8][3];
 int   accRgbN[8];
-float accRatioSum = 0;
+#define ACC_LEN_MAX 32
+float accLen[ACC_LEN_MAX];       // 프레임별 추정 길이(mm) → 확정 시 중앙값
+int   accLenN = 0;
 int   accFrames = 0;
 
 // 확정된 최신 측정 결과
 int curR = 0, curG = 0, curB = 0;
 uint16_t curColorCode = 0;
 uint16_t curSizeCode = 0;
-float curRatio = 0.0f;
+float curLenMm = 0.0f;           // 확정에 쓴 추정 길이 (안정화 프레임들의 중앙값)
 uint16_t detectCount = 0;
 
 uint32_t frameNo = 0;
@@ -448,11 +475,23 @@ const char* getSizeName(uint16_t code) {
   }
 }
 
-uint16_t classifySizeByRatio(float ratio) {
-  if (ratio <= 0) return 0;
-  if (ratio < RATIO_SMALL_MAX) return 1;   // 소 (35×35×35, 비율 약 1.0)
-  if (ratio <= RATIO_MEDIUM_MAX) return 2; // 중 (35×35×55, 비율 약 1.57)
-  return 3;                                // 대 (35×35×85, 비율 약 2.43)
+// 추정 길이(mm) → 크기 코드
+uint16_t classifySizeByLen(float mm) {
+  if (mm <= 0) return 0;
+  if (mm < SIZE_SMALL_MAX_MM) return 1;    // 소 (35×35×35)
+  if (mm < SIZE_MEDIUM_MAX_MM) return 2;   // 중 (35×35×55)
+  return 3;                                // 대 (35×35×85)
+}
+
+// 확정된 크기와 '확실히' 다른 길이인가 (경계 근처에서 흔들리는 값으로는 다시 판정하지 않는다)
+static bool sizeClearlyDiffers(float mm, uint16_t code) {
+  if (mm <= 0 || code == 0) return false;
+  const float m = SIZE_RECHECK_MM;
+  switch (code) {
+    case 1: return mm >= SIZE_SMALL_MAX_MM + m;
+    case 2: return mm < SIZE_SMALL_MAX_MM - m || mm >= SIZE_MEDIUM_MAX_MM + m;
+    default: return mm < SIZE_MEDIUM_MAX_MM - m;
+  }
 }
 
 // 보정된 RGB 픽셀의 색상 클래스: 0 = 무채색, 3~6 = 빨/노/초/파, 7 = 기타(보라/분홍)
@@ -703,6 +742,212 @@ static void classifyBlobColor(const uint8_t *buf, int count, ColorInfo &ci) {
 }
 
 // ==========================================
+// 12-1. 크기 측정 (원근 보정 + 옆면 제거 + 최소 외접 사각형)
+// ==========================================
+//  tools/size_check.py 의 measure()와 같은 계산 (학습 샘플로 검증·보정할 때 그 스크립트를 쓴다)
+const float IMG_CXF = IMG_W / 2.0f, IMG_CYF = IMG_H / 2.0f;   // 원근 보정 기준점 (영상 중심)
+#define CALIPER_N ((89 / SIZE_CALIPER_STEP) + 1)              // 0°, 3°, … 87°
+static float rowG[IMG_H], rowY[IMG_H], rowHx[IMG_H], rowHy[IMG_H];   // 행별 확대율 · 보정 y · 픽셀 반폭
+static float calCos[CALIPER_N], calSin[CALIPER_N];
+
+static void initSizeTables() {
+  for (int y = 0; y < IMG_H; y++) {
+    float dv = y - IMG_CYF;
+    float g = 1.0f / (1.0f + SIZE_PERSP_P * dv);
+    rowG[y] = g;
+    rowY[y] = SIZE_Y_SCALE * dv * g;
+    rowHx[y] = 0.5f * g;
+    rowHy[y] = 0.5f * SIZE_Y_SCALE * g * g;
+  }
+  for (int k = 0; k < CALIPER_N; k++) {
+    float a = k * SIZE_CALIPER_STEP * (float)M_PI / 180.0f;
+    calCos[k] = cosf(a);
+    calSin[k] = sinf(a);
+  }
+}
+
+// 보정 좌표 → 화면 좌표 (디버그 화면에 추정 윗면을 그릴 때)
+static void rectToImg(float X, float Y, float &x, float &y) {
+  float dv = Y / (SIZE_Y_SCALE - SIZE_PERSP_P * Y);
+  float g = 1.0f / (1.0f + SIZE_PERSP_P * dv);
+  x = IMG_CXF + X / g;
+  y = IMG_CYF + dv;
+}
+
+struct MBox { int x0, y0, x1, y1; };   // measMask가 들어 있는 범위 (ROI 안)
+
+static inline void boxAdd(MBox &bx, int x, int y) {
+  if (x < bx.x0) bx.x0 = x;
+  if (x > bx.x1) bx.x1 = x;
+  if (y < bx.y0) bx.y0 = y;
+  if (y > bx.y1) bx.y1 = y;
+}
+
+// 그림자 필터 없이 본 전경(fgRaw 비트 2)의 3x3 다수결
+static inline bool weakAt(int i) {
+  int s = 0;
+  for (int dy = -IMG_W; dy <= IMG_W; dy += IMG_W)
+    for (int dx = -1; dx <= 1; dx++) s += (fgRaw[i + dy + dx] >> 1) & 1;
+  return s >= 5;
+}
+
+// 검정 보강 (BLACK_GROW_COLS 설명 참고): 덩어리에서 시작해 '열별 바닥보다 위'인 약한 전경으로 키운다
+static int growBlack(MBox &bx) {
+  static int16_t colBot[IMG_W], winBot[IMG_W];
+  static const int DX[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+  static const int DY[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
+  for (int x = 0; x < IMG_W; x++) colBot[x] = -1;
+  int tail = 0;
+  for (int y = bx.y0; y <= bx.y1; y++) {
+    for (int x = bx.x0; x <= bx.x1; x++) {
+      int i = y * IMG_W + x;
+      if (measMask[i]) { colBot[x] = y; bfsQueue[tail++] = i; }
+    }
+  }
+  for (int x = 0; x < IMG_W; x++) {
+    int m = -1;
+    for (int k = max(0, x - BLACK_GROW_COLS); k <= min(IMG_W - 1, x + BLACK_GROW_COLS); k++) m = max(m, (int)colBot[k]);
+    winBot[x] = m;
+  }
+  int head = 0, added = 0;
+  while (head < tail) {
+    int i = bfsQueue[head++];
+    int x = i % IMG_W, y = i / IMG_W;
+    for (int k = 0; k < 8; k++) {
+      int nx = x + DX[k], ny = y + DY[k];
+      if (nx < ROI_X0 || nx > ROI_X1 || ny < ROI_Y0 || ny > ROI_Y1) continue;
+      int n = ny * IMG_W + nx;
+      if (measMask[n] || ny > winBot[nx] || !weakAt(n)) continue;
+      measMask[n] = 1;
+      bfsQueue[tail++] = n;
+      added++;
+      if (fgMap[n] < 3) fgMap[n] = 4;   // 화면 마스크에 보강 픽셀로 표시
+      boxAdd(bx, nx, ny);
+    }
+  }
+  return added;
+}
+
+// 3x3 열림(침식 후 팽창): 배경 가장자리 잡음으로 생긴 1~2px 가는 선·돌기 제거
+static void openMask(const MBox &bx) {
+  memset(measTmp, 0, IMG_N);
+  for (int y = bx.y0; y <= bx.y1; y++) {
+    for (int x = bx.x0; x <= bx.x1; x++) {
+      int i = y * IMG_W + x;
+      measTmp[i] = measMask[i - IMG_W - 1] & measMask[i - IMG_W] & measMask[i - IMG_W + 1] &
+                   measMask[i - 1] & measMask[i] & measMask[i + 1] &
+                   measMask[i + IMG_W - 1] & measMask[i + IMG_W] & measMask[i + IMG_W + 1];
+    }
+  }
+  for (int y = bx.y0; y <= bx.y1; y++) {
+    for (int x = bx.x0; x <= bx.x1; x++) {
+      int i = y * IMG_W + x;
+      if (!measMask[i]) continue;
+      measMask[i] = measTmp[i - IMG_W - 1] | measTmp[i - IMG_W] | measTmp[i - IMG_W + 1] |
+                    measTmp[i - 1] | measTmp[i] | measTmp[i + 1] |
+                    measTmp[i + IMG_W - 1] | measTmp[i + IMG_W] | measTmp[i + IMG_W + 1];
+    }
+  }
+}
+
+static int floodMask(int seed, uint8_t from, uint8_t to) {
+  static const int D[8] = {-IMG_W - 1, -IMG_W, -IMG_W + 1, -1, 1, IMG_W - 1, IMG_W, IMG_W + 1};
+  int head = 0, tail = 0;
+  bfsQueue[tail++] = seed;
+  measMask[seed] = to;
+  while (head < tail) {
+    int i = bfsQueue[head++];
+    for (int k = 0; k < 8; k++) {   // ROI 밖은 measMask가 항상 0
+      int n = i + D[k];
+      if (measMask[n] == from) { measMask[n] = to; bfsQueue[tail++] = n; }
+    }
+  }
+  return tail;
+}
+
+// 열림으로 떨어져 나간 조각을 버리고 가장 큰 덩어리만 남긴다. 반환: 남은 면적
+static int keepLargest(MBox &bx) {
+  int bestSeed = -1, bestArea = 0;
+  for (int y = bx.y0; y <= bx.y1; y++) {
+    for (int x = bx.x0; x <= bx.x1; x++) {
+      int i = y * IMG_W + x;
+      if (measMask[i] != 1) continue;
+      int a = floodMask(i, 1, 2);
+      if (a > bestArea) { bestArea = a; bestSeed = i; }
+    }
+  }
+  if (bestSeed < 0) return 0;
+  floodMask(bestSeed, 2, 3);
+  MBox nb = {IMG_W, IMG_H, -1, -1};
+  for (int y = bx.y0; y <= bx.y1; y++) {
+    for (int x = bx.x0; x <= bx.x1; x++) {
+      int i = y * IMG_W + x;
+      measMask[i] = measMask[i] == 3;
+      if (measMask[i]) boxAdd(nb, x, y);
+    }
+  }
+  bx = nb;
+  return bestArea;
+}
+
+// 보정 좌표에서 각도를 바꿔 가며 외접 사각형을 대고, 옆면 몫(side × 아래 방향 성분)을 뺀 넓이가 가장 작은 것 = 윗면
+//   옆면은 윗면을 아래로 side만큼 늘린 모양이라, 어느 방향의 폭에서든 'side × 그 방향의 세로 성분'만큼만 커진다.
+static void caliperMeasure(BlobInfo &b, const MBox &bx, float side) {
+  int ne = 0;   // 가장자리 픽셀만 (극값은 항상 가장자리에서 나온다)
+  for (int y = bx.y0; y <= bx.y1; y++) {
+    for (int x = bx.x0; x <= bx.x1; x++) {
+      int i = y * IMG_W + x;
+      if (measMask[i] && (!measMask[i - 1] || !measMask[i + 1] || !measMask[i - IMG_W] || !measMask[i + IMG_W]))
+        bfsQueue[ne++] = i;
+    }
+  }
+  if (ne < 3) return;
+  float bestA = 1e30f, bU0 = 0, bV0 = 0, bLu = 0, bLv = 0;
+  int bestK = 0;
+  for (int k = 0; k < CALIPER_N; k++) {
+    float c = calCos[k], s = calSin[k];
+    float u0 = 1e9f, u1 = -1e9f, v0 = 1e9f, v1 = -1e9f;
+    for (int e = 0; e < ne; e++) {
+      int i = bfsQueue[e];
+      int x = i % IMG_W, y = i / IMG_W;
+      float X = (x - IMG_CXF) * rowG[y], Y = rowY[y];
+      float pu = X * c + Y * s, pv = -X * s + Y * c;
+      float ru = rowHx[y] * c + rowHy[y] * s, rv = rowHx[y] * s + rowHy[y] * c;
+      if (pu - ru < u0) u0 = pu - ru;
+      if (pu + ru > u1) u1 = pu + ru;
+      if (pv - rv < v0) v0 = pv - rv;
+      if (pv + rv > v1) v1 = pv + rv;
+    }
+    float lu = max(1.0f, u1 - u0 - side * s), lv = max(1.0f, v1 - v0 - side * c);
+    if (lu * lv < bestA) { bestA = lu * lv; bestK = k; bU0 = u0; bV0 = v0; bLu = lu; bLv = lv; }
+  }
+  b.lenMm = max(bLu, bLv) * 35.0f / SIZE_PX_PER_35MM;
+  b.widMm = min(bLu, bLv) * 35.0f / SIZE_PX_PER_35MM;
+  // 추정 윗면 꼭짓점: u ∈ [u0, u0+lu], v ∈ [v0, v0+lv] (옆면은 u·v의 큰 쪽 끝에 붙어 있었음)
+  float c = calCos[bestK], s = calSin[bestK];
+  const float us[4] = {bU0, bU0 + bLu, bU0 + bLu, bU0}, vs[4] = {bV0, bV0, bV0 + bLv, bV0 + bLv};
+  for (int k = 0; k < 4; k++) rectToImg(us[k] * c - vs[k] * s, us[k] * s + vs[k] * c, b.boxX[k], b.boxY[k]);
+}
+
+// 선택 덩어리(fgMap >= 3) → [검정이면 보강] → 열림 → 가장 큰 덩어리 → 윗면 크기(mm)
+static void measureSize(BlobInfo &b, const ColorInfo &ci) {
+  b.lenMm = b.widMm = 0;
+  b.grown = 0;
+  b.sideCut = false;
+  if (!measMask || !measTmp || b.area <= 0) return;
+  memset(measMask, 0, IMG_N);
+  MBox bx = {b.minX, b.minY, b.maxX, b.maxY};
+  for (int y = bx.y0; y <= bx.y1; y++)
+    for (int x = bx.x0; x <= bx.x1; x++)
+      if (fgMap[y * IMG_W + x] >= 3) measMask[y * IMG_W + x] = 1;
+  if (ci.code == 2) b.grown = growBlack(bx);
+  openMask(bx);
+  if (keepLargest(bx) == 0) return;
+  b.sideCut = ci.code != 1;   // 흰색은 옆면이 잡히지 않는다 (판과 비슷한 회색이라 그림자 필터에 빠짐)
+  caliperMeasure(b, bx, b.sideCut ? SIDE_FACE_PX : 0.0f);
+}
+
+// ==========================================
 // 13. 디버그 화면 그리기
 // ==========================================
 static void drawLineLeft(int x0, int y0, int x1, int y1, uint16_t c) {
@@ -733,9 +978,10 @@ static uint16_t maskColor(int i, int x, int y) {
     }
   }
   if (v == 3) return 0x07FF;      // 선택 덩어리 가장자리 (색 판정 제외)
+  if (v == 4) return 0xA81F;      // 검정 보강 (반사로 회색이 된 검정 윗면을 되살린 픽셀)
   if (v == 2) return 0x8410;      // 다른 덩어리
   if (detState == ST_CONFIRMED && footMask[i]) return 0x7800;  // 확정 위치 중 비어 보이는 부분
-  if (fgRaw[i]) return 0x2945;    // 필터로 제거된 노이즈
+  if (fgRaw[i] & 1) return 0x2945;   // 필터로 제거된 노이즈
   return 0x0000;
 }
 
@@ -758,17 +1004,22 @@ static void renderDebug(const camera_fb_t *fb, const BlobInfo &best, const Color
   drawLineLeft(ROI_X1, ROI_Y1, ROI_X0, ROI_Y1, 0x8410);
   drawLineLeft(ROI_X0, ROI_Y1, ROI_X0, ROI_Y0, 0x8410);
 
-  // 측정된 회전 사각형 (노랑=안정화 중, 초록=확정, 빨강=무효/경계 접촉)
+  // 사각형 (노랑=안정화 중, 초록=확정, 빨강=무효/경계 접촉)
+  //   유효한 덩어리: 원근·옆면을 보정해 추정한 '윗면' / 무효: 덩어리의 모멘트 사각형
   if (best.area >= MIN_BLOB_AREA / 2) {
     uint16_t c = !best.valid ? 0xF800 : (detState == ST_CONFIRMED ? 0x07E0 : 0xFFE0);
-    float a = best.angleDeg * M_PI / 180.0f;
-    float ux = cosf(a), uy = sinf(a), vx = -uy, vy = ux;
-    float hl = best.len / 2, hw = best.wid / 2;
     int px[4], py[4];
-    const int SL[4] = {1, 1, -1, -1}, SW[4] = {1, -1, -1, 1};
-    for (int k = 0; k < 4; k++) {
-      px[k] = lroundf(best.cx + SL[k] * hl * ux + SW[k] * hw * vx);
-      py[k] = lroundf(best.cy + SL[k] * hl * uy + SW[k] * hw * vy);
+    if (best.lenMm > 0) {
+      for (int k = 0; k < 4; k++) { px[k] = lroundf(best.boxX[k]); py[k] = lroundf(best.boxY[k]); }
+    } else {
+      float a = best.angleDeg * M_PI / 180.0f;
+      float ux = cosf(a), uy = sinf(a), vx = -uy, vy = ux;
+      float hl = best.len / 2, hw = best.wid / 2;
+      const int SL[4] = {1, 1, -1, -1}, SW[4] = {1, -1, -1, 1};
+      for (int k = 0; k < 4; k++) {
+        px[k] = lroundf(best.cx + SL[k] * hl * ux + SW[k] * hw * vx);
+        py[k] = lroundf(best.cy + SL[k] * hl * uy + SW[k] * hw * vy);
+      }
     }
     for (int k = 0; k < 4; k++) drawLineLeft(px[k], py[k], px[(k + 1) % 4], py[(k + 1) % 4], c);
     int cx = lroundf(best.cx), cy = lroundf(best.cy);
@@ -800,7 +1051,7 @@ static void resetAccumulators() {
   memset(accColorVotes, 0, sizeof(accColorVotes));
   memset(accRgb, 0, sizeof(accRgb));
   memset(accRgbN, 0, sizeof(accRgbN));
-  accRatioSum = 0;
+  accLenN = 0;
   accFrames = 0;
 }
 
@@ -808,8 +1059,22 @@ static void accumulate(const BlobInfo &b, const ColorInfo &ci) {
   accColorVotes[ci.code]++;
   accRgb[ci.code][0] += ci.r; accRgb[ci.code][1] += ci.g; accRgb[ci.code][2] += ci.b;
   accRgbN[ci.code]++;
-  accRatioSum += b.ratio;
+  if (b.lenMm > 0 && accLenN < ACC_LEN_MAX) accLen[accLenN++] = b.lenMm;
   accFrames++;
+}
+
+// 안정화 프레임들의 추정 길이 중앙값 (한두 프레임이 손·흔들림으로 튀어도 영향 없음)
+static float medianLen() {
+  if (accLenN <= 0) return 0;
+  float t[ACC_LEN_MAX];
+  memcpy(t, accLen, accLenN * sizeof(float));
+  for (int i = 1; i < accLenN; i++) {
+    float v = t[i];
+    int j = i - 1;
+    while (j >= 0 && t[j] > v) { t[j + 1] = t[j]; j--; }
+    t[j + 1] = v;
+  }
+  return accLenN % 2 ? t[accLenN / 2] : (t[accLenN / 2 - 1] + t[accLenN / 2]) / 2;
 }
 
 static bool isSameBlob(const BlobInfo &a, const BlobInfo &b) {
@@ -862,7 +1127,10 @@ static bool isDifferentObject(const BlobInfo &b, const ColorInfo &ci, const Foot
   // 흰↔검은 그림자에 따라 뒤집힐 수 있어 교체 근거로 쓰지 않는다
   bool colorChanged = ci.code != 0 && ci.code != curColorCode &&
                       !(isAchromaticCode(ci.code) && isAchromaticCode(curColorCode));
-  return areaChanged || colorChanged;
+  // 추정 길이가 확정된 크기와 확실히 다름 — 놓는 도중(손에 가려지거나 기울어진 채) 확정되었다가
+  // 물체가 제자리를 잡은 경우도 여기서 바로잡는다 (면적 변화가 25%에 못 미쳐도)
+  bool sizeChanged = sizeClearlyDiffers(b.lenMm, curSizeCode);
+  return areaChanged || colorChanged || sizeChanged;
 }
 
 static void beginSettling(const BlobInfo &best, const ColorInfo &ci) {
@@ -887,13 +1155,13 @@ static bool tryConfirm() {
   for (int c = 1; c <= 6; c++) if (accColorVotes[c] > accColorVotes[best]) best = c;
   if (best == 0 || accFrames == 0) return false;
 
-  float ratio = accRatioSum / accFrames;
-  uint16_t size = classifySizeByRatio(ratio);
+  float lenMm = medianLen();
+  uint16_t size = classifySizeByLen(lenMm);
   if (size == 0) return false;
 
   curColorCode = best;
   curSizeCode = size;
-  curRatio = ratio;
+  curLenMm = lenMm;
   curR = accRgb[best][0] / accRgbN[best];
   curG = accRgb[best][1] / accRgbN[best];
   curB = accRgb[best][2] / accRgbN[best];
@@ -905,7 +1173,7 @@ static bool tryConfirm() {
   setReg(REG_B_VAL, (uint16_t)curB);
   setReg(REG_DETECT_CNT, detectCount);
   setReg(REG_SIZE_CODE, curSizeCode);
-  setReg(REG_RATIO_X100, (uint16_t)lroundf(curRatio * 100));
+  setReg(REG_RATIO_X100, (uint16_t)lroundf(curLenMm / 35.0f * 100));
   setReg(REG_PRESENT, 1);
   return true;
 }
@@ -941,17 +1209,17 @@ static void updateState(const BlobInfo &best, const ColorInfo &ci, const FootChe
         accumulate(best, ci);
       }
       prevBlob = best;
-      LOG("[DBG] 안정화 %d/%d 면적=%d 긴변=%.1f 짧은변=%.1f 비율=%.2f 각도=%.0f 색=%d(%s) 유채%.0f%% 밝기비%.2f\n",
-          stableCount, STABLE_FRAMES, best.area, best.len, best.wid, best.ratio, best.angleDeg,
-          ci.code, getColorName(ci.code), ci.chromaShare * 100, ci.vRatio);
+      LOG("[DBG] 안정화 %d/%d 면적=%d 추정 %.1fx%.1fmm%s 보강%d 색=%d(%s) 유채%.0f%% 밝기비%.2f\n",
+          stableCount, STABLE_FRAMES, best.area, best.lenMm, best.widMm, best.sideCut ? "(옆면 보정)" : "",
+          best.grown, ci.code, getColorName(ci.code), ci.chromaShare * 100, ci.vRatio);
 
       if (stableCount >= STABLE_FRAMES && millis() - settleStart >= STABLE_MIN_MS) {
         if (tryConfirm()) {
           detState = ST_CONFIRMED;
           saveFootprint(best);
-          EVENT("[#%u] 색상 %u:%s (R:%d G:%d B:%d) | 크기 %u:%s (변 비율: %.2f)",
+          EVENT("[#%u] 색상 %u:%s (R:%d G:%d B:%d) | 크기 %u:%s (추정 길이 %.0fmm)",
                 detectCount, curColorCode, getColorName(curColorCode), curR, curG, curB,
-                curSizeCode, getSizeName(curSizeCode), curRatio);
+                curSizeCode, getSizeName(curSizeCode), curLenMm);
         } else {
           if (!settleWarned) {
             EVENT("색상 판정 불가 (보라/분홍 계열?) — 계속 관찰");
@@ -983,8 +1251,8 @@ static void updateState(const BlobInfo &best, const ColorInfo &ci, const FootChe
         }
         changePrev = best;
         if (changeCount >= CHANGE_FRAMES && millis() - changeStart >= CHANGE_MIN_MS) {
-          EVENT("다른 물체로 교체됨 (면적 %d→%d, 색 %s→%s) → 제거 처리 후 다시 판정",
-                confBlob.area, best.area, getColorName(curColorCode), getColorName(ci.code));
+          EVENT("다른 물체로 교체됨 (면적 %d→%d, 색 %s→%s, 길이 %.0f→%.0fmm) → 다시 판정",
+                confBlob.area, best.area, getColorName(curColorCode), getColorName(ci.code), curLenMm, best.lenMm);
           markRemoved();
           beginSettling(best, ci);
         }
@@ -1017,14 +1285,14 @@ struct Sample {
   int8_t   bg = -1;                // 배경 스냅샷 번호 (-1 = 없음)
   uint8_t  sizeLabel = 0, colorLabel = 0;   // 정답 (0 = 미입력)
   uint8_t  predSize = 0, predColor = 0;     // 장치 판정 = PLC로 보낸 확정 결과
-  float    confRatio = 0;          // 확정에 쓴 평균 비율
+  float    confLenMm = 0;          // 확정에 쓴 추정 길이 (mm)
   int16_t  confRgb[3] = {0};
-  uint8_t  frameSize = 0;          // 저장한 프레임 한 장의 비율로 본 크기
+  uint8_t  frameSize = 0;          // 저장한 프레임 한 장의 추정 길이로 본 크기
   BlobInfo blob;                   // 저장한 프레임의 덩어리 측정값 (좌표는 전체 화면 기준)
   ColorInfo color;
   float    plate[3] = {0}, gain[3] = {0};
   uint8_t  raw[ROI_N * 2];         // ROI 원본 RGB565 (카메라 바이트 순서: 상위 바이트 먼저)
-  uint8_t  mask[ROI_N / 4];        // 2비트/픽셀: 0 배경, 1 다른 덩어리, 2 선택 덩어리 가장자리, 3 선택 덩어리 내부
+  uint8_t  mask[ROI_N / 4];        // 2비트/픽셀: 0 배경, 1 다른 덩어리, 2 선택 덩어리, 3 검정 보강 픽셀
 };
 struct BgSnap { uint8_t ver; uint32_t ms; uint8_t *rgb; };   // rgb: ROI_N×3 (R,G,B 순)
 
@@ -1119,9 +1387,9 @@ static void serviceLearnRequest(const uint8_t *buf, const BlobInfo &best, const 
     s->ms = now;
     s->predSize = curSizeCode;
     s->predColor = curColorCode;
-    s->confRatio = curRatio;
+    s->confLenMm = curLenMm;
     s->confRgb[0] = curR; s->confRgb[1] = curG; s->confRgb[2] = curB;
-    s->frameSize = classifySizeByRatio(best.ratio);
+    s->frameSize = classifySizeByLen(best.lenMm);
     s->blob = best;
     s->color = ci;
     s->plate[0] = plateR; s->plate[1] = plateG; s->plate[2] = plateB;
@@ -1130,7 +1398,7 @@ static void serviceLearnRequest(const uint8_t *buf, const BlobInfo &best, const 
       memcpy(s->raw + y * ROI_W * 2, buf + ((y + ROI_Y0) * IMG_W + ROI_X0) * 2, ROI_W * 2);
       for (int x = 0; x < ROI_W; x++) {
         uint8_t v = fgMap[(y + ROI_Y0) * IMG_W + x + ROI_X0];
-        uint8_t lv = v == 0 ? 0 : v < 3 ? 1 : v == 3 ? 2 : 3;
+        uint8_t lv = v == 0 ? 0 : v < 3 ? 1 : v == 4 ? 3 : 2;
         int k = y * ROI_W + x;
         s->mask[k >> 2] |= lv << ((k & 3) * 2);
       }
@@ -1144,18 +1412,18 @@ static void serviceLearnRequest(const uint8_t *buf, const BlobInfo &best, const 
   if (isSize) s->sizeLabel = label; else s->colorLabel = label;
   uint8_t pred = isSize ? s->predSize : s->predColor;
   uint16_t id = s->id;
-  float ratio = s->confRatio;
+  float lenMm = s->confLenMm;
   int count = smpCount;
   xSemaphoreGive(smpMutex);
 
   const char *labelName = isSize ? getSizeName(label) : getColorName(label);
   const char *predName = isSize ? getSizeName(pred) : getColorName(pred);
-  EVENT("[학습] 샘플 #%u %s 정답 %s / 판별 %s %s (비율 %.2f)%s", id, isSize ? "크기" : "색상", labelName, predName,
-        label == pred ? "O" : "X", ratio, merged ? (prevLabel ? " — 라벨 수정" : " — 같은 물체에 추가") : "");
+  EVENT("[학습] 샘플 #%u %s 정답 %s / 판별 %s %s (길이 %.0fmm)%s", id, isSize ? "크기" : "색상", labelName, predName,
+        label == pred ? "O" : "X", lenMm, merged ? (prevLabel ? " — 라벨 수정" : " — 같은 물체에 추가") : "");
   learnFinish("{\"ok\":true,\"id\":%u,\"merged\":%s,\"corrected\":%s,\"kind\":\"%s\",\"label\":%u,\"pred\":%u,"
-              "\"labelName\":\"%s\",\"predName\":\"%s\",\"ratio\":%.3f,\"count\":%d}",
+              "\"labelName\":\"%s\",\"predName\":\"%s\",\"lenMm\":%.1f,\"count\":%d}",
               id, merged ? "true" : "false", merged && prevLabel ? "true" : "false", isSize ? "size" : "color",
-              label, pred, labelName, predName, ratio, count);
+              label, pred, labelName, predName, lenMm, count);
 }
 
 // ==========================================
@@ -1187,9 +1455,10 @@ void processFrame(camera_fb_t *fb) {
       bool shadow = USE_SHADOW_FILTER && curV < bgV && curV * 100 >= bgV * SHADOW_MIN_PCT &&
                     abs(curC - bgC) < CHROMA_THRESH;
       bool isFg = chromaFg || (dSum >= DIFF_THRESH && !shadow);
+      bool weakFg = chromaFg || dSum >= DIFF_THRESH;   // 그림자 필터 없이 (검정 보강용)
+      fgRaw[i] = (isFg ? 1 : 0) | (weakFg ? 2 : 0);
 
       if (isFg) {
-        fgRaw[i] = 1;
         fgRawCount++;
       } else if (doBgUpdate && dSum <= BG_TRACK_MAX) {
         bgR[i] = br + bgStep(r - br);
@@ -1206,9 +1475,9 @@ void processFrame(camera_fb_t *fb) {
   for (int y = ROI_Y0; y <= ROI_Y1; y++) {
     for (int x = ROI_X0; x <= ROI_X1; x++) {
       int i = y * IMG_W + x;
-      int s = fgRaw[i - IMG_W - 1] + fgRaw[i - IMG_W] + fgRaw[i - IMG_W + 1] +
-              fgRaw[i - 1] + fgRaw[i] + fgRaw[i + 1] +
-              fgRaw[i + IMG_W - 1] + fgRaw[i + IMG_W] + fgRaw[i + IMG_W + 1];
+      int s = (fgRaw[i - IMG_W - 1] & 1) + (fgRaw[i - IMG_W] & 1) + (fgRaw[i - IMG_W + 1] & 1) +
+              (fgRaw[i - 1] & 1) + (fgRaw[i] & 1) + (fgRaw[i + 1] & 1) +
+              (fgRaw[i + IMG_W - 1] & 1) + (fgRaw[i + IMG_W] & 1) + (fgRaw[i + IMG_W + 1] & 1);
       if (s >= 5) { fgMap[i] = 1; fgCount++; }
     }
   }
@@ -1227,13 +1496,16 @@ void processFrame(camera_fb_t *fb) {
     }
   }
 
-  // 4단계: 크기(회전 무관) + 색상
+  // 4단계: 색상 → 크기 (색에 따라 검정 보강·옆면 보정 여부가 달라짐)
   ColorInfo ci;
   if (best.area > 0) {
     measureBlob(best);
     best.valid = best.area >= MIN_BLOB_AREA && !best.touchesBorder;
     int count = floodComponent(best.seed, 2, 3, nullptr);
-    if (best.valid) classifyBlobColor(buf, count, ci);
+    if (best.valid) {
+      classifyBlobColor(buf, count, ci);
+      measureSize(best, ci);
+    }
   }
 
   // 5단계: 확정된 물체 자리 점검 → 상태 머신 (안정화 → 확정 → 제거/교체)
@@ -1305,7 +1577,7 @@ details[open] summary{margin-bottom:10px}
 <section class="card wide">
  <h2>카메라 영상 <span class="sub">왼쪽: 카메라 + 측정 · 오른쪽: 전경 마스크</span></h2>
  <img id="s" alt="카메라 스트림">
- <div class="legend">사각형 — 노랑: 안정화 중, 초록: 확정, 빨강: 무효(ROI 경계 접촉). 마스크 — 픽셀별 색 분류, 하늘색: 가장자리(판정 제외), 회색: 다른 덩어리, 진한 빨강: 확정 위치 중 비어 보이는 부분, 어두운 점: 제거된 노이즈</div>
+ <div class="legend">사각형 = 원근·옆면을 보정해 추정한 물체 윗면 — 노랑: 안정화 중, 초록: 확정, 빨강: 무효(ROI 경계 접촉). 마스크 — 픽셀별 색 분류, 하늘색: 가장자리(판정 제외), 보라: 검정 보강(반사로 회색이 된 검정 윗면), 회색: 다른 덩어리, 진한 빨강: 확정 위치 중 비어 보이는 부분, 어두운 점: 제거된 노이즈</div>
  <div class="row"><button onclick="relearn()">배경 재학습</button>
  <a href="/capture" target="_blank">캡처(JPG)</a><a href="/raw.bmp" target="_blank">원본(BMP)</a><a href="/status" target="_blank">상태(JSON)</a></div>
 </section>
@@ -1321,7 +1593,7 @@ details[open] summary{margin-bottom:10px}
  <div id="lnAcc"></div>
  <div class="row"><a href="/samples.zip">ZIP으로 모두 받기</a><button onclick="lnDel('last=1','마지막 샘플을 삭제할까요?')">마지막 샘플 삭제</button><button onclick="lnDel('all=1','저장된 샘플을 모두 삭제할까요? (ZIP으로 받아 두었는지 확인)')">전체 삭제</button></div>
  <details style="margin-top:10px"><summary>샘플 목록</summary><div class="tbl"><table>
- <thead><tr><th>#</th><th>크기 정답→판별</th><th>색상 정답→판별</th><th>비율(확정)</th><th>긴변×짧은변</th><th>위치(x,y)</th><th>각도</th><th>영상</th><th></th></tr></thead>
+ <thead><tr><th>#</th><th>크기 정답→판별</th><th>색상 정답→판별</th><th>길이(확정)</th><th>이 프레임 길이×폭</th><th>위치(x,y)</th><th>보강</th><th>영상</th><th></th></tr></thead>
  <tbody id="lnList"></tbody></table></div></details>
 </section>
 <section class="card">
@@ -1375,7 +1647,7 @@ const REGS=[
  ['G 값',v=>'〃'],
  ['B 값',v=>'〃'],
  ['감지 누적 횟수',v=>'새 물체가 확정될 때마다 +1 (값이 바뀌면 새 데이터)'],
- ['변 비율 ×100',v=>'긴변/짧은변 = '+(v/100).toFixed(2)],
+ ['길이비 ×100',v=>'추정 길이 ÷ 35mm = '+(v/100).toFixed(2)+` (약 ${Math.round(v*0.35)}mm)`],
  ['명령',v=>({0:'0 = 대기',1:'1 = 배경 재학습 요청',2:'2 = 재학습 진행 중'})[v]??String(v)],
 ];
 const tb=$('regs');
@@ -1397,11 +1669,12 @@ function render(j){
  if(c.count>0){
   $('sw').style.background=SW[c.color]||'';
   $('res').textContent=`${c.colorName} · ${c.sizeName}`;
-  $('resSub').textContent=`#${c.count} · 색상 ${c.color} · 크기 ${c.size} · RGB(${c.rgb.join(', ')}) · 변 비율 ${c.ratio.toFixed(2)}`;
+  $('resSub').textContent=`#${c.count} · 색상 ${c.color} · 크기 ${c.size} · RGB(${c.rgb.join(', ')}) · 추정 길이 ${c.lenMm.toFixed(0)}mm`;
  }
  const b=j.blob;
+ const meas=b.lenMm>0?` · 추정 ${b.lenMm.toFixed(0)}×${b.widMm.toFixed(0)}mm${b.grown?` (검정 보강 ${b.grown}px)`:''} → ${b.size}`:'';
  const rows=[['판 위 물체',regs[REG_PRESENT]?'<span class="pill ok">있음</span>':(c.count>0?'<span class="pill">없음 — 위 결과는 마지막 감지</span>':'<span class="pill">없음</span>')],
-  ['현재 프레임',b.area>0?`덩어리 ${b.area}px · ${b.valid?'유효':'무효'+(b.touchesBorder?'(경계 접촉)':'(작음)')} · 비율 ${b.ratio.toFixed(2)} → ${b.size}`:'변화 없음'],
+  ['현재 프레임',b.area>0?`덩어리 ${b.area}px · ${b.valid?'유효':'무효'+(b.touchesBorder?'(경계 접촉)':'(작음)')}${meas}`:'변화 없음'],
   ['현재 프레임 색',j.color.samples>0?`${j.color.name} · RGB(${j.color.rgb.join(', ')})`:'-']];
  if(j.state=='SETTLING')rows.push(['안정화',`${j.stable}프레임`]);
  if(j.state=='CONFIRMED')rows.push(['확정 위치 점유율',`${Math.round(j.spot.occupancy*100)}% (35% 미만이 이어지면 제거로 판정)`]);
@@ -1521,7 +1794,7 @@ async function learn(k,v){
   if(!j.ok){$('lnMsg').innerHTML=`<span class="pill bad">저장 안 됨</span> ${j.error}`;}
   else{
    const m=j.label==j.pred;
-   $('lnMsg').innerHTML=`<span class="pill ${m?'ok':'bad'}">${m?'판별 일치':'판별 틀림'}</span> 샘플 #${j.id} ${j.kind=='size'?'크기':'색상'} 정답 <b>${j.labelName}</b> / 장치 판별 <b>${j.predName}</b> · 비율 ${j.ratio.toFixed(2)}`+
+   $('lnMsg').innerHTML=`<span class="pill ${m?'ok':'bad'}">${m?'판별 일치':'판별 틀림'}</span> 샘플 #${j.id} ${j.kind=='size'?'크기':'색상'} 정답 <b>${j.labelName}</b> / 장치 판별 <b>${j.predName}</b> · 추정 길이 ${j.lenMm.toFixed(0)}mm`+
     (j.corrected?' · 라벨을 고쳤습니다':j.merged?' · 같은 물체 샘플에 추가':'')+` · 저장 ${j.count}개`;
    $('lnThumbs').innerHTML=`<img src="/sample.bmp?id=${j.id}&k=raw" alt="원본"><img src="/sample.bmp?id=${j.id}&k=mask" alt="마스크">`;
   }
@@ -1553,7 +1826,7 @@ async function lnLoad(){
   $('lnAcc').innerHTML=h+'</div>';
   $('lnList').innerHTML=S.slice().reverse().map(s=>{
    const c1=s.size?(s.size==s.predSize?'o':'x'):'',c2=s.color?(s.color==s.predColor?'o':'x'):'';
-   return `<tr><td>${s.id}</td><td class="${c1}">${SZS[s.size]}→${SZS[s.predSize]}</td><td class="${c2}">${CLS[s.color]}→${CLS[s.predColor]}</td><td>${s.confRatio.toFixed(2)}</td><td>${s.len.toFixed(1)}×${s.wid.toFixed(1)}</td><td>${s.cx.toFixed(0)}, ${s.cy.toFixed(0)}</td><td>${s.angle.toFixed(0)}°</td>`+
+   return `<tr><td>${s.id}</td><td class="${c1}">${SZS[s.size]}→${SZS[s.predSize]}</td><td class="${c2}">${CLS[s.color]}→${CLS[s.predColor]}</td><td>${s.confLenMm.toFixed(0)}mm</td><td>${s.lenMm.toFixed(0)}×${s.widMm.toFixed(0)}mm</td><td>${s.cx.toFixed(0)}, ${s.cy.toFixed(0)}</td><td>${s.grown?s.grown+'px':''}</td>`+
     `<td><a href="/sample.bmp?id=${s.id}&k=raw" target="_blank">원본</a> <a href="/sample.bmp?id=${s.id}&k=mask" target="_blank">마스크</a></td><td><button onclick="lnDel('id=${s.id}','샘플 #${s.id}을 삭제할까요?')">삭제</button></td></tr>`;}).join('');
  }catch(e){}
 }
@@ -1623,22 +1896,24 @@ static esp_err_t status_handler(httpd_req_t *req) {
     "{\"state\":\"%s\",\"fps\":%.1f,\"frame\":%lu,\"stable\":%d,"
     "\"fgRaw\":%d,\"fg\":%d,\"components\":%d,"
     "\"blob\":{\"area\":%d,\"valid\":%s,\"touchesBorder\":%s,\"cx\":%.1f,\"cy\":%.1f,"
-    "\"len\":%.1f,\"wid\":%.1f,\"ratio\":%.2f,\"angle\":%.0f,\"size\":\"%s\"},"
+    "\"len\":%.1f,\"wid\":%.1f,\"ratio\":%.2f,\"angle\":%.0f,"
+    "\"lenMm\":%.1f,\"widMm\":%.1f,\"sideCut\":%s,\"grown\":%d,\"size\":\"%s\"},"
     "\"color\":{\"code\":%d,\"name\":\"%s\",\"rgb\":[%d,%d,%d],\"samples\":%d,\"chromaShare\":%.2f,\"vRatio\":%.2f,"
     "\"votes\":{\"white\":%d,\"black\":%d,\"red\":%d,\"yellow\":%d,\"green\":%d,\"blue\":%d,\"other\":%d}},"
     "\"spot\":{\"area\":%d,\"occupancy\":%.2f,\"bestOverlap\":%.2f,\"removeStreak\":%d,\"changeCount\":%d},"
     "\"plate\":{\"rgb\":[%.0f,%.0f,%.0f],\"gray\":%.0f,\"gain\":[%.2f,%.2f,%.2f]},"
-    "\"confirmed\":{\"count\":%u,\"color\":%u,\"colorName\":\"%s\",\"size\":%u,\"sizeName\":\"%s\",\"ratio\":%.2f,\"rgb\":[%d,%d,%d]}",
+    "\"confirmed\":{\"count\":%u,\"color\":%u,\"colorName\":\"%s\",\"size\":%u,\"sizeName\":\"%s\",\"lenMm\":%.1f,\"ratio\":%.2f,\"rgb\":[%d,%d,%d]}",
     STATE_NAMES[st.state], st.fps, (unsigned long)st.frameNo, st.stableCount,
     st.fgRawCount, st.fgCount, st.components,
     b.area, b.valid ? "true" : "false", b.touchesBorder ? "true" : "false", b.cx, b.cy,
-    b.len, b.wid, b.ratio, b.angleDeg, getSizeName(classifySizeByRatio(b.ratio)),
+    b.len, b.wid, b.ratio, b.angleDeg,
+    b.lenMm, b.widMm, b.sideCut ? "true" : "false", b.grown, getSizeName(classifySizeByLen(b.lenMm)),
     c.code, getColorName(c.code), c.r, c.g, c.b, c.samples, c.chromaShare, c.vRatio,
     c.votes[1], c.votes[2], c.votes[3], c.votes[4], c.votes[5], c.votes[6], c.votes[7],
     st.footArea, st.foot.occ, st.foot.bestOverlap, st.removeStreak, st.changeCount,
     plateR, plateG, plateB, plateGray, gainR, gainG, gainB,
     detectCount, curColorCode, getColorName(curColorCode), curSizeCode, getSizeName(curSizeCode),
-    curRatio, curR, curG, curB);
+    curLenMm, curLenMm / 35.0f, curR, curG, curB);
 
   // 카메라 · Wi-Fi · 시스템
   unsigned long now = millis();
@@ -1849,7 +2124,7 @@ static size_t bmpFromRgb(uint8_t *out, const uint8_t *rgb) {
 // 마스크 → 8비트 팔레트 BMP (픽셀 값 = 마스크 단계 0~3)
 static size_t bmpFromMask(uint8_t *out, const uint8_t *mask) {
   size_t o = bmpHeader(out, ROI_W, ROI_H, 8, 256);
-  static const uint8_t PAL[4][3] = {{0, 0, 0}, {90, 90, 90}, {255, 160, 0}, {255, 255, 255}};   // R,G,B
+  static const uint8_t PAL[4][3] = {{0, 0, 0}, {90, 90, 90}, {255, 255, 255}, {170, 0, 255}};   // R,G,B
   for (int k = 0; k < 4; k++) { out[54 + k * 4] = PAL[k][2]; out[55 + k * 4] = PAL[k][1]; out[56 + k * 4] = PAL[k][0]; }
   for (int y = ROI_H - 1; y >= 0; y--) {
     for (int x = 0; x < ROI_W; x++) {
@@ -1868,10 +2143,11 @@ static void sampleFileName(char *out, size_t cap, const Sample *s, const char *k
 static size_t sampleJson(char *o, size_t cap, const Sample *s, bool full) {
   const BlobInfo &b = s->blob;
   size_t n = snprintf(o, cap,
-    "{\"id\":%u,\"det\":%u,\"ms\":%lu,\"size\":%u,\"color\":%u,\"predSize\":%u,\"predColor\":%u,\"confRatio\":%.3f,"
-    "\"frameSize\":%u,\"area\":%d,\"cx\":%.2f,\"cy\":%.2f,\"len\":%.2f,\"wid\":%.2f,\"ratio\":%.3f,\"angle\":%.1f",
-    s->id, s->det, (unsigned long)s->ms, s->sizeLabel, s->colorLabel, s->predSize, s->predColor, s->confRatio,
-    s->frameSize, b.area, b.cx, b.cy, b.len, b.wid, b.ratio, b.angleDeg);
+    "{\"id\":%u,\"det\":%u,\"ms\":%lu,\"size\":%u,\"color\":%u,\"predSize\":%u,\"predColor\":%u,\"confLenMm\":%.1f,"
+    "\"frameSize\":%u,\"lenMm\":%.1f,\"widMm\":%.1f,\"grown\":%d,"
+    "\"area\":%d,\"cx\":%.2f,\"cy\":%.2f,\"len\":%.2f,\"wid\":%.2f,\"ratio\":%.3f,\"angle\":%.1f",
+    s->id, s->det, (unsigned long)s->ms, s->sizeLabel, s->colorLabel, s->predSize, s->predColor, s->confLenMm,
+    s->frameSize, b.lenMm, b.widMm, b.grown, b.area, b.cx, b.cy, b.len, b.wid, b.ratio, b.angleDeg);
   if (full && n < cap) {
     const ColorInfo &c = s->color;
     char fr[40], fm[40];
@@ -1892,18 +2168,22 @@ static size_t sampleJson(char *o, size_t cap, const Sample *s, bool full) {
 
 // 전체 메타데이터 + 샘플 목록 JSON (PSRAM 버퍼를 할당해 반환, 호출자가 free)
 static char *samplesJson(bool full, size_t *outLen) {
-  size_t cap = 2048 + (size_t)SMP_MAX * (full ? 760 : 330);
+  size_t cap = 2048 + (size_t)SMP_MAX * (full ? 820 : 390);
   char *o = (char *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
   if (!o) return nullptr;
   xSemaphoreTake(smpMutex, portMAX_DELAY);
   size_t n = snprintf(o, cap,
     "{\"fw\":\"%s\",\"host\":\"%s\",\"count\":%d,\"max\":%d,\"psramFree\":%u,"
-    "\"img\":[%d,%d],\"roi\":[%d,%d,%d,%d],\"ratioSmallMax\":%.2f,\"ratioMediumMax\":%.2f,"
+    "\"img\":[%d,%d],\"roi\":[%d,%d,%d,%d],"
+    "\"sizeModel\":{\"perspP\":%.5f,\"yScale\":%.4f,\"pxPer35mm\":%.2f,\"sidePx\":%.1f,\"smallMaxMm\":%.1f,\"mediumMaxMm\":%.1f,"
+    "\"blackGrowCols\":%d,\"whiteBlackSplit\":%.2f},"
     "\"sizeNames\":[\"미입력\",\"소(35mm)\",\"중(55mm)\",\"대(85mm)\"],"
     "\"colorNames\":[\"미입력\",\"흰색\",\"검정색\",\"빨간색\",\"노란색\",\"초록색\",\"파란색\"],"
-    "\"maskLevels\":\"0 배경, 1 다른 덩어리, 2 선택 덩어리 가장자리, 3 선택 덩어리 내부\",\"backgrounds\":[",
+    "\"maskLevels\":\"0 배경, 1 다른 덩어리, 2 선택 덩어리, 3 검정 보강 픽셀\",\"backgrounds\":[",
     FW_VERSION, HOSTNAME, smpCount, SMP_MAX, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-    IMG_W, IMG_H, ROI_X0, ROI_Y0, ROI_X1, ROI_Y1, RATIO_SMALL_MAX, RATIO_MEDIUM_MAX);
+    IMG_W, IMG_H, ROI_X0, ROI_Y0, ROI_X1, ROI_Y1,
+    SIZE_PERSP_P, SIZE_Y_SCALE, SIZE_PX_PER_35MM, SIDE_FACE_PX, SIZE_SMALL_MAX_MM, SIZE_MEDIUM_MAX_MM,
+    BLACK_GROW_COLS, WHITE_BLACK_SPLIT);
   for (int k = 0; k < bgSnapCount && n < cap; k++)
     n += snprintf(o + n, cap - n, "%s{\"bg\":%d,\"ver\":%u,\"ms\":%lu,\"file\":\"bg%d.bmp\"}", k ? "," : "", k,
                   bgSnap[k].ver, (unsigned long)bgSnap[k].ms, k);
@@ -2411,6 +2691,10 @@ void setup() {
   bfsQueue = (uint16_t *)allocBig(IMG_N * sizeof(uint16_t));
   footMask = (uint8_t *)allocBig(IMG_N);
   if (footMask) memset(footMask, 0, IMG_N);
+  measMask = (uint8_t *)allocBig(IMG_N);
+  measTmp = (uint8_t *)allocBig(IMG_N);
+  if (measMask) memset(measMask, 0, IMG_N);
+  initSizeTables();
   if (ENABLE_WEB) {
     dbgBuf = (uint8_t *)allocBig(DBG_W * DBG_H * 2);
     rawBuf = (uint8_t *)allocBig(IMG_N * 2);
@@ -2419,7 +2703,7 @@ void setup() {
     if (rawBuf) memset(rawBuf, 0, IMG_N * 2);
     if (!dbgBuf || !rawBuf) { dbgBuf = nullptr; EVENT("[ERR] 디버그 버퍼 할당 실패"); }
   }
-  if (!bgR || !bgG || !bgB || !fgRaw || !fgMap || !bfsQueue || !footMask) {
+  if (!bgR || !bgG || !bgB || !fgRaw || !fgMap || !bfsQueue || !footMask || !measMask || !measTmp) {
     LOG("[ERR] 작업 버퍼 할당 실패\n");
     while (true) { delay(1000); }
   }
