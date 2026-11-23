@@ -17,7 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-#define FW_VERSION "2026.11.20-size"    // 웹 화면·/status에 표시 (장치가 여러 대일 때 어떤 펌웨어인지 구분)
+#define FW_VERSION "2026.11.23"         // 웹 화면·/status에 표시 (장치가 여러 대일 때 어떤 펌웨어인지 구분)
 
 // ==========================================
 // 1. 운용 모드 스위치 (둘 다 켜도 됨)
@@ -294,6 +294,11 @@ uint16_t detectCount = 0;
 
 uint32_t frameNo = 0;
 float fps = 0;
+// 메인 루프(카메라 → 감지·판정 → 명령) 한 바퀴의 최대 간격. Wi-Fi가 끊기거나 웹을 많이 써도 변하지 않아야 정상
+//   (웹 '카메라 · 시스템'에 표시, LOOP_STALL_WARN_MS를 넘으면 감지 기록에 남김. 배경 학습의 약 3초는 제외)
+const unsigned long LOOP_STALL_WARN_MS = 1000;
+volatile unsigned long loopGapMax10s = 0, loopGapMaxBoot = 0;
+bool loopGapSkip = false;          // 배경 학습(일부러 약 3초 머묾) 직후 한 번은 재지 않음
 bool lastBestValid = false;      // 마지막 프레임에 물체로 보이는 덩어리가 있었나 (PLC 명령 1·2의 '판 비었나' 확인용)
 uint8_t bgVersion = 0;           // 배경 학습에 성공할 때마다 +1 (학습 데이터의 배경 스냅샷 구분용)
 
@@ -631,6 +636,7 @@ bool learnBackground(bool readapt) {
   } else {
     EVENT("[BG] 배경 학습 실패 — 카메라 프레임을 받지 못함");
   }
+  loopGapSkip = true;   // 이 약 3초는 메인 루프 지연으로 세지 않는다
   return got > 0;
 }
 
@@ -1744,7 +1750,8 @@ void processFrame(camera_fb_t *fb) {
   updateState(best, ci, lastFoot);
   if (ENABLE_WEB) serviceLearnRequest(buf, best, ci);
 
-  if (ENABLE_WEB) renderDebug(fb, best, ci, fgRawCount, fgCount, components);
+  // 디버그 화면은 웹 서버가 시작된 뒤(= Wi-Fi가 한 번이라도 연결된 뒤)에만 그린다. 볼 사람이 없으면 CPU만 쓴다
+  if (ENABLE_WEB && webStarted) renderDebug(fb, best, ci, fgRawCount, fgCount, components);
 }
 
 // ==========================================
@@ -1976,6 +1983,7 @@ function render(j){
  kv($('sysKv'),[
   ['카메라',cam.ok?`<span class="pill ok">정상</span> ${PIDS[cam.pid]||''} (PID 0x${cam.pid.toString(16).toUpperCase()})`:'<span class="pill bad">초기화 실패</span> 배선/전원 확인 후 재부팅'],
   ['처리 속도',`${j.fps.toFixed(1)} fps · 처리 ${j.frame}프레임`],
+  ['메인 루프 지연',j.loopGapMs==null?'-':`최근 10초 최대 ${j.loopGapMs}ms · 부팅 후 최대 ${j.loopGapMaxMs}ms <span class="sub">(배경 학습 제외. Wi-Fi가 끊겨도 같아야 정상, 1초를 넘으면 감지 기록에 남음)</span>`],
   ['프레임 수신',`마지막 ${ago(cam.lastFrameAgo)} · 실패 누적 ${cam.fails}회`],
   ['펌웨어',j.fw||'(이전 버전)'],
   ['가동 시간',upt(j.uptime)],
@@ -2229,10 +2237,11 @@ static esp_err_t status_handler(httpd_req_t *req) {
   unsigned long now = millis();
   unsigned long lastFrame = lastFrameMs;
   n = jsonAppend(json, cap, n,
-    ",\"fw\":\"" FW_VERSION "\",\"samples\":%d,\"uptime\":%lu,\"heap\":%u,\"psram\":%u,"
+    ",\"fw\":\"" FW_VERSION "\",\"samples\":%d,\"uptime\":%lu,\"loopGapMs\":%lu,\"loopGapMaxMs\":%lu,\"heap\":%u,\"psram\":%u,"
     "\"camera\":{\"ok\":%s,\"pid\":%u,\"fails\":%lu,\"lastFrameAgo\":%ld},"
     "\"wifi\":{\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"host\":\"%s\"",
-    smpCount, now, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(),
+    smpCount, now, (unsigned long)loopGapMax10s, (unsigned long)loopGapMaxBoot,
+    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(),
     cameraOk ? "true" : "false", (unsigned)camPid, (unsigned long)camFails,
     lastFrame ? (long)(now - lastFrame) : -1L,
     ssid, WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(), HOSTNAME);
@@ -2761,6 +2770,11 @@ void startWebServers() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.stack_size = 8192;
+  // 웹 서버(포트 80·81)는 코어 0 (Wi-Fi·네트워크와 같은 코어)에 고정한다.
+  //   기본값(코어 지정 없음, 우선순위 5)이면 영상 스트림 JPEG 인코딩·ZIP 만들기가 코어 1에서 돌면서
+  //   우선순위 1인 메인 루프(감지·판정)를 밀어낸다. 코어 1은 메인 루프와 Modbus 태스크만 쓴다.
+  //   코어 0의 Wi-Fi(23)·lwIP(18)·카메라 태스크는 우선순위가 더 높아 웹 처리에 밀리지 않는다.
+  config.core_id = 0;
   httpd_uri_t uris[] = {
     {.uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL},
     {.uri = "/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL},
@@ -3114,6 +3128,26 @@ void setup() {
 void loop() {
   static unsigned long fpsT0 = 0;
   static int fpsFrames = 0;
+
+  // 메인 루프 간격 측정 — 한 바퀴가 LOOP_STALL_WARN_MS를 넘으면 무엇인가 감지·판정을 막고 있다는 뜻
+  static unsigned long prevLoopMs = 0, gapWinStart = 0, gapWin = 0, stallLogMs = 0;
+  static uint32_t stallCount = 0;
+  unsigned long loopNow = millis();
+  if (prevLoopMs && !loopGapSkip) {
+    unsigned long gap = loopNow - prevLoopMs;
+    if (gap > gapWin) gapWin = gap;
+    if (gap > loopGapMaxBoot) loopGapMaxBoot = gap;
+    if (gap >= LOOP_STALL_WARN_MS) {
+      stallCount++;
+      if (stallLogMs == 0 || loopNow - stallLogMs >= 10000) {   // 감지 기록이 넘치지 않게 10초에 한 번만
+        EVENT("[SYS] 메인 루프가 %lu ms 멈춤 (감지·판정이 그만큼 늦어짐, 누적 %lu회)", gap, (unsigned long)stallCount);
+        stallLogMs = loopNow;
+      }
+    }
+  }
+  loopGapSkip = false;
+  prevLoopMs = loopNow;
+  if (loopNow - gapWinStart >= 10000) { loopGapMax10s = gapWin; gapWin = 0; gapWinStart = loopNow; }
 
   if (ENABLE_MODBUS) {
     // 웹 표시용 사본을 실제 레지스터 값으로 맞춘다 (PLC가 쓴 값 포함). 요청 응답은 modbusTask가 따로 처리
