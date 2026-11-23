@@ -409,15 +409,33 @@ static void logEvent(const char *fmt, ...) {
   xSemaphoreGive(evtMutex);
 }
 
-// Modbus 홀딩 레지스터 쓰기 (웹 표시용 사본도 함께 갱신)
+// Modbus는 전용 태스크(modbusTask)가 1ms마다 처리한다.
+//   예전에는 메인 루프가 영상을 한 장 처리할 때마다(0.15~0.3초) mb.task()를 한 번 불러서 응답이 40~300ms로 들쭉날쭉했고,
+//   PLC 응답 대기 시간을 넘긴 응답은 PLC 프레임 모니터에 '모름'으로 찍혀 버려졌다. 이제 요청 후 수 ms 안에 응답한다.
+//   레지스터는 메인 루프(판정 결과 쓰기)와 이 태스크(PLC 읽기/쓰기)가 함께 쓰므로 mbMutex로 보호한다.
+//   재귀 뮤텍스: 확정 결과 여러 개를 쓰는 동안 바깥에서 한 번 더 잡아, PLC가 반쯤 바뀐 값을 읽지 않게 한다 (tryConfirm)
+SemaphoreHandle_t mbMutex = nullptr;
+static inline void mbLock() { if (mbMutex) xSemaphoreTakeRecursive(mbMutex, portMAX_DELAY); }
+static inline void mbUnlock() { if (mbMutex) xSemaphoreGiveRecursive(mbMutex); }
+
+static void modbusTask(void *) {
+  for (;;) {
+    mbLock();
+    mb.task();
+    mbUnlock();
+    vTaskDelay(1);   // 1ms (FreeRTOS tick 1kHz)
+  }
+}
+
+// Modbus 레지스터 쓰기 — 홀딩(FC03, 40001~)과 입력(FC04, 30001~)에 같은 값. 웹 표시용 사본도 함께 갱신
 static void setReg(uint16_t addr, uint16_t val) {
   if (addr >= REG_COUNT) return;
   regMirror[addr] = val;
-  if (ENABLE_MODBUS) mb.Hreg(addr, val);
-}
-
-static inline void mbTask() {
-  if (ENABLE_MODBUS) mb.task();
+  if (!ENABLE_MODBUS) return;
+  mbLock();
+  mb.Hreg(addr, val);
+  mb.Ireg(addr, val);
+  mbUnlock();
 }
 
 // Modbus 요청 콜백 (mb.task() 안에서 호출됨) — 통신 상태 표시용
@@ -437,20 +455,10 @@ static Modbus::ResultCode onMbSuccess(Modbus::FunctionCode fc, const Modbus::Req
   return Modbus::EX_SUCCESS;
 }
 
-// Modbus 모드에서는 대기 중에도 PLC 요청에 응답
-static void serviceDelay(unsigned long ms) {
-  unsigned long t0 = millis();
-  do {
-    mbTask();
-    delay(2);
-  } while (millis() - t0 < ms);
-}
-
 static void flushFrames(int n) {
   for (int i = 0; i < n; i++) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
-    mbTask();
   }
 }
 
@@ -601,7 +609,6 @@ void learnBackground(bool readapt) {
       got++;
     }
     esp_camera_fb_return(fb);
-    mbTask();
   }
   if (got > 0) {
     for (int i = 0; i < IMG_N; i++) {
@@ -1167,6 +1174,8 @@ static bool tryConfirm() {
   curB = accRgb[best][2] / accRgbN[best];
   detectCount++;
 
+  // 한 번에 기록: 그동안 PLC 요청은 기다렸다가 처리된다 → 한 번의 읽기로 항상 같은 판정 결과의 값들을 받는다
+  mbLock();
   setReg(REG_COLOR_CODE, curColorCode);
   setReg(REG_R_VAL, (uint16_t)curR);
   setReg(REG_G_VAL, (uint16_t)curG);
@@ -1175,6 +1184,7 @@ static bool tryConfirm() {
   setReg(REG_SIZE_CODE, curSizeCode);
   setReg(REG_RATIO_X100, (uint16_t)lroundf(curLenMm / 35.0f * 100));
   setReg(REG_PRESENT, 1);
+  mbUnlock();
   return true;
 }
 
@@ -1610,7 +1620,7 @@ details[open] summary{margin-bottom:10px}
  <div class="tbl"><table>
  <thead><tr><th>주소</th><th>오프셋</th><th>항목</th><th style="text-align:right">값</th><th class="hx">HEX</th><th>접근</th><th>의미</th></tr></thead>
  <tbody id="regs"></tbody></table></div>
- <p class="note" id="mbNote">FC03(Read Holding Registers)로 40001부터 9개를 한 번에 읽으면 됩니다. 오프셋은 0부터 세는 주소입니다(PLC 설정에 따라 사용). 40009에 1을 쓰면(FC06) 배경을 다시 학습합니다 → 진행 중 2 → 완료 0.</p>
+ <p class="note" id="mbNote">FC03(Read Holding Registers, 40001~) 또는 FC04(Read Input Registers, 30001~)로 오프셋 0부터 9개를 한 번에 읽으면 됩니다. 두 함수는 같은 값을 돌려줍니다. 오프셋은 0부터 세는 주소입니다(PLC 프레임에 실제로 들어가는 값, 예: 오프셋 3 = 40004/30004 = R 값). 40009에 1을 쓰면(FC06) 배경을 다시 학습합니다 → 진행 중 2 → 완료 0.</p>
 </section>
 <section class="card">
  <h2>통신 상태</h2>
@@ -1661,7 +1671,7 @@ function upt(ms){const s=Math.floor(ms/1000);return Math.floor(s/3600)+'시간 '
 function regRange(fc,a,n){
  if(fc==6)return `${40001+a} ← ${n}`;
  if(fc==3||fc==16||fc==23)return n>1?`${40001+a}~${40000+a+n} (${n}개)`:`${40001+a}`;
- if(fc==4)return n>1?`${30001+a}~${30000+a+n} (${n}개) — 입력 레지스터는 없음`:`${30001+a} — 입력 레지스터는 없음`;
+ if(fc==4)return (n>1?`${30001+a}~${30000+a+n} (${n}개)`:`${30001+a}`)+` = ${40001+a}${n>1?'~'+(40000+a+n):''}과 같은 값`;
  return `주소 ${a}, ${n}`;}
 function render(j){
  const c=j.confirmed,m=j.modbus,regs=m.regs,st=STATES[j.state]||[j.state,''];
@@ -1695,7 +1705,7 @@ function render(j){
   if(m.requests){r.push(['함수',`FC${String(m.lastFc).padStart(2,'0')} ${FCN[m.lastFc]||''}`],['대상',regRange(m.lastFc,m.lastAddr,m.lastArg)],['결과',m.lastOk?'<span class="pill ok">정상 응답</span>':'<span class="pill bad">오류 응답</span> 주소 범위/함수 코드 확인']);}
   kv($('mbKv'),r);
   if(m.requests==0)hint='요청이 한 번도 없으면 ESP32-CAM-MB가 빠져 있는지 확인하고, TXD/RXD 연결을 서로 바꿔 보고, 485 배선(A/B), 보오율, 슬레이브 ID를 확인하세요. CRC 오류나 다른 ID로 보낸 요청은 집계되지 않습니다.';
-  else if(m.requests>m.ok)hint='오류 응답은 없는 주소(40010 이후 등)나 지원하지 않는 함수 코드를 요청했을 때 생깁니다.';
+  else if(m.requests>m.ok)hint='오류 응답은 없는 주소(오프셋 9 이후 = 40010/30010 이후)나 지원하지 않는 함수 코드(FC03·FC04·FC06·FC16 외)를 요청했을 때 생깁니다.';
  }
  $('mbHint').textContent=hint;
  const cam=j.camera,w=j.wifi;
@@ -2635,8 +2645,8 @@ static void networkTask() {
   if (ENABLE_MODBUS) {
     bool link = mbReqCount > 0 && now - mbLastReqMs < MB_LINK_TIMEOUT_MS;
     if (link && !mbLinkUp) {
-      EVENT("[485] PLC 요청 수신 시작 (FC%02u, 주소 %u, %s)", (unsigned)mbLastFc, 40001u + mbLastAddr,
-            mbLastOk ? "정상 응답" : "오류 응답");
+      EVENT("[485] PLC 요청 수신 시작 (FC%02u, 주소 %u, %s)", (unsigned)mbLastFc,
+            (mbLastFc == 4 ? 30001u : 40001u) + mbLastAddr, mbLastOk ? "정상 응답" : "오류 응답");
     } else if (!link && mbLinkUp) {
       EVENT("[485] %lu초 넘게 PLC 요청 없음", MB_LINK_TIMEOUT_MS / 1000);
     }
@@ -2727,11 +2737,15 @@ void setup() {
     MB_SERIAL.setDebugOutput(false);
     mb.begin(&MB_SERIAL, RS485_DE_RE_PIN);
     mb.slave(SLAVE_ID);
-    for (int i = 0; i < REG_COUNT; i++) mb.addHreg(i, 0);
+    mb.addHreg(0, 0, REG_COUNT);         // FC03 홀딩 레지스터 40001~ (40009는 PLC가 쓰는 명령)
+    mb.addIreg(0, 0, REG_COUNT);         // FC04 입력 레지스터 30001~ — 같은 값 (PLC가 FC04로 읽는 경우)
     mb.onRequest(onMbRequest);           // 통신 상태(요청 수/마지막 요청) 집계
     mb.onRequestSuccess(onMbSuccess);
-    EVENT("[485] Modbus RTU 시작: 슬레이브 ID %d, %dbps 8N1, 40001~%d (UART0 TX=GPIO%d RX=GPIO%d)",
-          SLAVE_ID, MODBUS_BAUD, 40000 + REG_COUNT, MB_TX_PIN, MB_RX_PIN);
+    mbMutex = xSemaphoreCreateRecursiveMutex();
+    // 코어 1(메인 루프와 같은 코어)에서 웹 서버(우선순위 5)·메인 루프(1)보다 높은 우선순위로 → 영상 처리·JPEG 인코딩 중에도 응답
+    xTaskCreatePinnedToCore(modbusTask, "modbus", 4096, nullptr, 6, nullptr, 1);
+    EVENT("[485] Modbus RTU 시작: 슬레이브 ID %d, %dbps 8N1, FC03 40001~%d / FC04 30001~%d (UART0 TX=GPIO%d RX=GPIO%d)",
+          SLAVE_ID, MODBUS_BAUD, 40000 + REG_COUNT, 30000 + REG_COUNT, MB_TX_PIN, MB_RX_PIN);
   }
 
   // Wi-Fi는 기다리지 않는다 (Modbus 운용 중 Wi-Fi가 없어도 멈추지 않게). 연결되면 networkTask()가 웹 서버를 시작
@@ -2765,9 +2779,10 @@ void loop() {
   static int fpsFrames = 0;
 
   if (ENABLE_MODBUS) {
-    mb.task();
-    // 웹 표시용 사본을 실제 레지스터 값으로 맞춘다 (PLC가 쓴 값 포함)
+    // 웹 표시용 사본을 실제 레지스터 값으로 맞춘다 (PLC가 쓴 값 포함). 요청 응답은 modbusTask가 따로 처리
+    mbLock();
     for (int i = 0; i < REG_COUNT; i++) regMirror[i] = mb.Hreg(i);
+    mbUnlock();
     if (regMirror[REG_COMMAND] == 1) {
       setReg(REG_COMMAND, 2);
       relearnRequested = true;
@@ -2813,5 +2828,5 @@ void loop() {
     failLogMs = millis();
   }
 
-  serviceDelay(1);
+  delay(1);
 }
