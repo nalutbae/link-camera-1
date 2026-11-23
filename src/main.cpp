@@ -77,7 +77,8 @@ const unsigned long MB_LINK_TIMEOUT_MS = 5000;   // 이 시간 동안 요청이 
 #define REG_B_VAL       5       // 40006: B 값
 #define REG_DETECT_CNT  6       // 40007: 새 물체 감지 누적 횟수
 #define REG_RATIO_X100  7       // 40008: 길이비 x 100 = 추정 길이 ÷ 35mm (예: 157 = 약 55mm). 소≈100, 중≈157, 대≈243
-#define REG_COMMAND     8       // 40009: 명령. PLC가 1을 쓰면 배경 재학습 → 진행 중 2 → 완료 0
+#define REG_COMMAND     8       // 40009: 명령/상태. PLC가 명령 코드(1~4)를 쓰면 실행 → 100+N(실행 중) → 0(완료) 또는 200+N(실패)
+                                //        명령 목록과 상태 값은 '14-2. PLC 명령' 참고
 #define REG_COUNT       9
 
 // LOG   : 매 프레임 상세 로그 — 시리얼 전용
@@ -293,7 +294,7 @@ uint16_t detectCount = 0;
 
 uint32_t frameNo = 0;
 float fps = 0;
-volatile bool relearnRequested = false;
+bool lastBestValid = false;      // 마지막 프레임에 물체로 보이는 덩어리가 있었나 (PLC 명령 1·2의 '판 비었나' 확인용)
 uint8_t bgVersion = 0;           // 배경 학습에 성공할 때마다 +1 (학습 데이터의 배경 스냅샷 구분용)
 
 // 카메라 상태
@@ -568,7 +569,8 @@ void resetDetectionState() {
   setReg(REG_PRESENT, 0);
 }
 
-void learnBackground(bool readapt) {
+// 반환: 배경을 새로 학습했으면 true
+bool learnBackground(bool readapt) {
   sensor_t *s = esp_camera_sensor_get();
 
   if (readapt) {
@@ -593,7 +595,7 @@ void learnBackground(bool readapt) {
   uint16_t *acc = (uint16_t *)allocBig(IMG_N * 3 * sizeof(uint16_t));
   if (!acc) {
     EVENT("[BG] 메모리 부족 — 배경 학습 실패");
-    return;
+    return false;
   }
   memset(acc, 0, IMG_N * 3 * sizeof(uint16_t));
   int got = 0;
@@ -629,6 +631,7 @@ void learnBackground(bool readapt) {
   } else {
     EVENT("[BG] 배경 학습 실패 — 카메라 프레임을 받지 못함");
   }
+  return got > 0;
 }
 
 // ==========================================
@@ -1275,6 +1278,222 @@ static void updateState(const BlobInfo &best, const ColorInfo &ci, const FootChe
 }
 
 // ==========================================
+// 14-2. PLC 명령 (40009)
+// ==========================================
+//  PLC가 40009(오프셋 8)에 FC06으로 명령 코드를 '한 번' 쓰면 장치가 실행하고, 같은 레지스터에 진행 상태를 돌려준다.
+//  웹 화면의 명령 버튼(/cmd?c=N)도 이 레지스터에 같은 값을 써서 똑같이 동작한다.
+//
+//  명령 (PLC가 쓰는 값)
+//    1  초기화           배경 재학습 + 감지 결과(40001~40008)·누적 감지 횟수를 0으로.   판이 비어 있어야 함, 약 3초
+//    2  배경 재학습      배경만 다시 학습. 마지막 결과·누적 횟수는 유지(40003만 0).     판이 비어 있어야 함, 약 3초
+//    3  감지 결과 초기화  감지 결과·누적 감지 횟수를 0으로 (배경 유지). 판 위 물체는 #1로 다시 판정.  즉시
+//    4  다시 판정        확정을 취소하고 판 위 물체를 처음부터 다시 판정 (누적 횟수는 이어서 +1).   즉시
+//
+//  상태 (장치가 쓰는 값)
+//    0        대기 — 이전 명령 완료. 새 명령을 쓸 수 있음
+//    1~4      PLC가 쓴 명령을 장치가 아직 읽지 않음 (보통 0.2초 안에 100+N으로 바뀜)
+//    100+N    N번 명령 실행 중 (101~104)
+//    200+N    N번 명령 실패 (201~204). PLC가 0이나 새 명령을 쓸 때까지 유지. 이유는 웹 '감지 기록'
+//    299      지원하지 않는 값을 씀
+//
+//  1·2번은 판 위에 물체가 보이면(유효한 덩어리) 최대 CMD_EMPTY_WAIT_MS 동안 치워지기를 기다리고, 그래도 있으면 실패(201/202).
+//  물체가 있는 채로 배경을 학습하면 그 물체가 배경이 되어, 치운 뒤 그 자리가 '물체'로 보이고 같은 자리의 물체는 안 보인다.
+//  (조명이 크게 바뀌어 화면 전체가 달라진 경우는 ROI 경계에 닿는 덩어리라 물체로 보지 않으므로 그대로 실행된다)
+#define CMD_INIT      1
+#define CMD_RELEARN   2
+#define CMD_RESET     3
+#define CMD_REJUDGE   4
+#define CMD_MAX       4
+#define CMD_RUNNING   100
+#define CMD_FAILED    200
+#define CMD_UNKNOWN   299
+const unsigned long CMD_EMPTY_WAIT_MS = 2000;   // 1·2번: 판이 비기를 기다리는 최대 시간 (로봇이 막 치운 직후 대비)
+
+static const char *cmdName(uint16_t c) {
+  switch (c) {
+    case CMD_INIT: return "초기화";
+    case CMD_RELEARN: return "배경 재학습";
+    case CMD_RESET: return "감지 결과 초기화";
+    case CMD_REJUDGE: return "다시 판정";
+    default: return "알 수 없음";
+  }
+}
+
+// 웹 표시용 마지막 명령 정보 (status_handler가 cmdMux 안에서 복사)
+struct CmdState {
+  uint32_t seq = 0;              // 끝난 명령 수 — 웹이 결과가 나왔는지 알아채는 용도
+  uint16_t code = 0;             // 마지막(또는 실행 중) 명령 값
+  uint8_t  phase = 0;            // 0 없음, 1 실행 중, 2 완료, 3 실패
+  bool     fromWeb = false;
+  bool     byObject = false;     // 실패 이유가 '판 위 물체' (웹에서 그래도 실행할지 묻기 위함)
+  unsigned long startMs = 0, endMs = 0;
+  char     msg[112] = "";
+} cmdSt;
+portMUX_TYPE cmdMux = portMUX_INITIALIZER_UNLOCKED;
+
+uint16_t cmdDevVal = 0;          // 장치가 마지막으로 40009에 쓴 값 — 지금 값이 이것과 다르면 PLC(또는 웹)가 새로 쓴 것
+volatile int  webCmdCode = 0;    // 웹 버튼이 쓴 명령 (출처 표시용)
+volatile bool webCmdForce = false;   // 웹에서 '그래도 실행' — 판 비었는지 확인을 건너뜀
+int  pendCmd = 0;                // 1·2번: 판이 비기를 기다리는 중인 명령
+bool pendForce = false;
+uint32_t pendFrame = 0;
+unsigned long pendDeadline = 0;
+
+static uint16_t readCmdReg() { return ENABLE_MODBUS ? mb.Hreg(REG_COMMAND) : regMirror[REG_COMMAND]; }
+
+// 감지 결과와 누적 감지 횟수를 0으로 (40001~40008) — 한 번에 기록
+static void resetResults() {
+  detectCount = 0;
+  curColorCode = curSizeCode = 0;
+  curLenMm = 0;
+  curR = curG = curB = 0;
+  mbLock();
+  for (int i = 0; i < REG_COMMAND; i++) setReg(i, 0);
+  mbUnlock();
+}
+
+static void cmdBegin(uint16_t code, bool fromWeb) {
+  portENTER_CRITICAL(&cmdMux);
+  cmdSt.code = code;
+  cmdSt.phase = 1;
+  cmdSt.fromWeb = fromWeb;
+  cmdSt.byObject = false;
+  cmdSt.startMs = millis();
+  cmdSt.endMs = 0;
+  cmdSt.msg[0] = 0;
+  portEXIT_CRITICAL(&cmdMux);
+}
+
+// 명령 종료: 결과를 40009에 쓴다 (단, 실행하는 동안 PLC가 다른 값을 썼으면 덮어쓰지 않고 그 값을 다음에 처리)
+static void cmdEnd(uint16_t regVal, bool ok, bool byObject, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static void cmdEnd(uint16_t regVal, bool ok, bool byObject, const char *fmt, ...) {
+  char m[sizeof(cmdSt.msg)];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(m, sizeof(m), fmt, ap);
+  va_end(ap);
+  mbLock();
+  if (readCmdReg() == cmdDevVal) {
+    setReg(REG_COMMAND, regVal);
+    cmdDevVal = regVal;
+  }
+  mbUnlock();
+  unsigned long now = millis();
+  portENTER_CRITICAL(&cmdMux);
+  cmdSt.phase = ok ? 2 : 3;
+  cmdSt.byObject = byObject;
+  cmdSt.endMs = now;
+  memcpy(cmdSt.msg, m, sizeof(m));
+  cmdSt.seq++;
+  portEXIT_CRITICAL(&cmdMux);
+  EVENT("[명령] %u %s %s (%.1f초): %s", cmdSt.code, cmdName(cmdSt.code), ok ? "완료" : "실패",
+        (now - cmdSt.startMs) / 1000.0f, m);
+}
+
+// 웹 버튼: PLC와 똑같이 40009에 명령 값을 쓴다
+static void webCommand(int code, bool force) {
+  webCmdForce = force;
+  webCmdCode = code;
+  mbLock();
+  setReg(REG_COMMAND, code);
+  mbUnlock();
+}
+
+// 메인 루프 시작마다: 40009에 새 값이 쓰였는지 보고 접수
+static void pollCommand() {
+  mbLock();
+  uint16_t v = readCmdReg();
+  if (v == cmdDevVal) { mbUnlock(); return; }   // 새로 쓴 값 없음
+  uint16_t ack = v == 0 ? 0 : (v <= CMD_MAX ? CMD_RUNNING + v : CMD_UNKNOWN);
+  setReg(REG_COMMAND, ack);                     // 받자마자 '실행 중'으로 (PLC가 접수를 바로 확인)
+  cmdDevVal = ack;
+  mbUnlock();
+
+  bool web = webCmdCode != 0 && webCmdCode == (int)v;
+  bool force = web && webCmdForce;
+  webCmdCode = 0;
+  webCmdForce = false;
+  const char *src = web ? "웹" : "PLC";
+
+  if (pendCmd) {   // 판이 비기를 기다리던 명령은 새로 쓴 값으로 대체된다
+    EVENT("[명령] %d %s 취소 — %s가 40009에 %u을(를) 씀", pendCmd, cmdName(pendCmd), src, v);
+    pendCmd = 0;
+    portENTER_CRITICAL(&cmdMux);
+    cmdSt.phase = 3;
+    cmdSt.endMs = millis();
+    snprintf(cmdSt.msg, sizeof(cmdSt.msg), "새로 쓴 값 %u으로 취소", v);
+    cmdSt.seq++;
+    portEXIT_CRITICAL(&cmdMux);
+  }
+  if (v == 0) return;                           // 0 쓰기 = 실패 표시 지우기 (또는 대기 중 명령 취소)
+
+  cmdBegin(v, web);
+  if (v > CMD_MAX) {
+    cmdEnd(CMD_UNKNOWN, false, false, "%s가 지원하지 않는 값 %u을 씀 (명령은 1~%d)", src, v, CMD_MAX);
+    return;
+  }
+  EVENT("[명령] %s → %u %s", src, v, cmdName(v));
+  switch (v) {
+    case CMD_INIT:
+    case CMD_RELEARN:
+      if (!cameraOk) {
+        cmdEnd(CMD_FAILED + v, false, false, "카메라 초기화 실패 상태라 배경을 학습할 수 없음");
+        return;
+      }
+      pendCmd = v;              // 판이 비었는지는 명령을 받은 뒤 찍은 프레임으로 확인 (servicePendingCommand)
+      pendForce = force || !isBgReady;   // 배경이 아직 없으면 확인할 방법이 없으므로 바로 학습
+      pendFrame = frameNo;
+      pendDeadline = millis() + CMD_EMPTY_WAIT_MS;
+      break;
+    case CMD_RESET:
+      resetResults();
+      resetDetectionState();
+      cmdEnd(0, true, false, "감지 결과(40001~40008)와 누적 감지 횟수를 0으로. 판 위 물체가 있으면 #1로 다시 판정");
+      break;
+    case CMD_REJUDGE:
+      resetDetectionState();
+      cmdEnd(0, true, false, "확정 취소 — 판 위 물체를 다시 판정 (새 결과는 누적 %u회 다음 번호)", detectCount);
+      break;
+  }
+}
+
+// 메인 루프에서 프레임 처리 뒤마다: 1·2번 명령을 판이 비었을 때 실행
+static void servicePendingCommand() {
+  if (!pendCmd) return;
+  bool late = (long)(millis() - pendDeadline) >= 0;
+  if (!pendForce) {
+    if (frameNo < pendFrame + 2) {              // 명령을 받은 뒤 찍힌 프레임이 아직 없음
+      if (late) {
+        int c = pendCmd;
+        pendCmd = 0;
+        cmdEnd(CMD_FAILED + c, false, false, "카메라 프레임을 받지 못해 판 상태를 확인할 수 없음");
+      }
+      return;
+    }
+    if (lastBestValid) {
+      if (!late) return;                        // 물체가 치워지기를 기다림
+      int c = pendCmd;
+      pendCmd = 0;
+      cmdEnd(CMD_FAILED + c, false, true, "판 위에 물체가 있음 (%.0f초 기다림). 판을 비우고 다시 쓰세요",
+             CMD_EMPTY_WAIT_MS / 1000.0f);
+      return;
+    }
+  }
+  int c = pendCmd;
+  pendCmd = 0;
+  if (!learnBackground(true)) {
+    cmdEnd(CMD_FAILED + c, false, false, "배경 학습 실패 — 카메라 프레임을 받지 못함");
+    return;
+  }
+  if (c == CMD_INIT) {
+    resetResults();
+    cmdEnd(0, true, false, "배경 재학습 + 감지 결과(40001~40008)·누적 감지 횟수 0");
+  } else {
+    cmdEnd(0, true, false, "배경 재학습 (마지막 결과·누적 %u회 유지)", detectCount);
+  }
+}
+
+// ==========================================
 // 14-1. 학습 데이터 수집 (웹의 크기/색상 학습 버튼)
 // ==========================================
 //   버튼을 누르면 '확정'된 물체의 원본 영상·전경 마스크·측정값을 정답(라벨)과 함께 PSRAM에 저장한다.
@@ -1518,6 +1737,8 @@ void processFrame(camera_fb_t *fb) {
     }
   }
 
+  lastBestValid = best.valid;
+
   // 5단계: 확정된 물체 자리 점검 → 상태 머신 (안정화 → 확정 → 제거/교체)
   lastFoot = detState == ST_CONFIRMED ? checkFootprint(best) : FootCheck();
   updateState(best, ci, lastFoot);
@@ -1573,6 +1794,9 @@ td.b{width:45%}tr.rec td{background:#16351f}
 .lrow button{min-width:74px;padding:9px 12px;font-weight:600}
 .dot{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:6px;border:1px solid #666;vertical-align:-1px}
 td.x{color:var(--bad);font-weight:700}td.o{color:var(--ok)}
+table.wrap td{white-space:normal;vertical-align:top}table.wrap td:first-child{width:56px}
+table.cmdt td:nth-child(2),table.cmdt td:nth-child(5),table.cmdt td:last-child{white-space:nowrap}
+ul.note{padding-left:18px}ul.note li{margin:3px 0}
 .thumbs{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 .thumbs img{width:240px;max-width:48%;aspect-ratio:4/3}
 .cm td,.cm th{text-align:center;padding:4px 8px}
@@ -1582,7 +1806,7 @@ button:disabled{opacity:.5;cursor:wait}
 summary{cursor:pointer;color:var(--mute);font-weight:600;font-size:13px}
 details[open] summary{margin-bottom:10px}
 </style></head><body>
-<header><h1>ESP32-CAM 큐브 판별</h1><span id="mode" class="pill"></span><span id="conn" class="pill">연결 중…</span><button id="lnTog" onclick="lnToggle()" title="학습 데이터 수집 영역 보이기/숨기기 (이 브라우저에 기억됨)">학습 모드</button></header>
+<header><h1>ESP32-CAM 큐브 판별</h1><span id="mode" class="pill"></span><span id="conn" class="pill">연결 중…</span><button id="lnTog" onclick="lnToggle()" title="학습 데이터 수집 영역 보이기/숨기기 (페이지를 열 때마다 꺼진 상태로 시작)">학습 모드</button></header>
 <main>
 <section class="card wide">
  <h2>카메라 영상 <span class="sub">왼쪽: 카메라 + 측정 · 오른쪽: 전경 마스크</span></h2>
@@ -1620,7 +1844,46 @@ details[open] summary{margin-bottom:10px}
  <div class="tbl"><table>
  <thead><tr><th>주소</th><th>오프셋</th><th>항목</th><th style="text-align:right">값</th><th class="hx">HEX</th><th>접근</th><th>의미</th></tr></thead>
  <tbody id="regs"></tbody></table></div>
- <p class="note" id="mbNote">FC03(Read Holding Registers, 40001~) 또는 FC04(Read Input Registers, 30001~)로 오프셋 0부터 9개를 한 번에 읽으면 됩니다. 두 함수는 같은 값을 돌려줍니다. 오프셋은 0부터 세는 주소입니다(PLC 프레임에 실제로 들어가는 값, 예: 오프셋 3 = 40004/30004 = R 값). 40009에 1을 쓰면(FC06) 배경을 다시 학습합니다 → 진행 중 2 → 완료 0.</p>
+ <p class="note" id="mbNote">FC03(Read Holding Registers, 40001~) 또는 FC04(Read Input Registers, 30001~)로 오프셋 0부터 9개를 한 번에 읽으면 됩니다. 두 함수는 같은 값을 돌려줍니다. 오프셋은 0부터 세는 주소입니다(PLC 프레임에 실제로 들어가는 값, 예: 오프셋 3 = 40004/30004 = R 값). 40009는 PLC가 명령을 쓰는 자리입니다(FC06) — 아래 <b>PLC 명령</b> 참고.</p>
+</section>
+<section class="card wide" id="cmdCard">
+ <h2>PLC 명령 (40009) <span id="cmdPill" class="pill">대기</span></h2>
+ <p class="note" style="margin:0 0 8px">PLC가 <b>40009(오프셋 8)</b>에 FC06으로 명령 값을 <b>한 번</b> 쓰면 장치가 실행하고, 같은 레지스터에 진행 상태를 돌려줍니다 (100+명령 = 실행 중 → 0 = 완료, 200+명령 = 실패). 아래 <b>실행</b> 버튼도 PLC와 똑같이 40009에 값을 쓰므로 PLC 없이 시험할 수 있습니다.</p>
+ <div class="tbl"><table class="wrap cmdt">
+ <thead><tr><th>값</th><th>명령</th><th>하는 일</th><th>조건 · 걸리는 시간</th><th>실행 중 / 실패</th><th></th></tr></thead>
+ <tbody>
+ <tr><td class="v">1</td><td><b>초기화</b></td><td>배경을 다시 학습하고, 감지 결과(40001~40008)와 <b>누적 감지 횟수(40007)</b>를 모두 0으로 만듭니다. 작업(교대·로트)을 새로 시작할 때.</td><td>판이 비어 있어야 함 (물체가 보이면 최대 2초 기다림) · 약 3초</td><td>101 / 201</td><td><button onclick="cmd(1)">실행</button></td></tr>
+ <tr><td class="v">2</td><td><b>배경 재학습</b></td><td>배경만 다시 학습합니다. 마지막 결과와 누적 감지 횟수는 그대로 두고, 40003(물체 있음)만 0이 됩니다. 조명이 바뀌었거나 빈 판인데 물체가 있다고 나올 때.</td><td>판이 비어 있어야 함 (최대 2초 기다림) · 약 3초</td><td>102 / 202</td><td><button onclick="cmd(2)">실행</button></td></tr>
+ <tr><td class="v">3</td><td><b>감지 결과 초기화</b></td><td>감지 결과(40001~40008)와 누적 감지 횟수를 0으로 만듭니다. 배경은 그대로. 판 위에 물체가 있으면 그 물체가 #1로 다시 판정됩니다.</td><td>즉시</td><td>103 / 203</td><td><button onclick="cmd(3)">실행</button></td></tr>
+ <tr><td class="v">4</td><td><b>다시 판정</b></td><td>지금 확정된 결과를 취소하고 판 위 물체를 처음부터 다시 판정합니다. 누적 감지 횟수는 이어서 +1 (새 결과로 받음).</td><td>즉시 (새 결과는 약 1초 뒤)</td><td>104 / 204</td><td><button onclick="cmd(4)">실행</button></td></tr>
+ </tbody></table></div>
+ <dl class="kv" id="cmdKv"></dl>
+ <p class="note" id="cmdMsg"></p>
+ <details style="margin-top:10px"><summary>40009 값의 의미와 PLC 프로그램 작성 방법</summary>
+ <div class="tbl"><table class="wrap"><thead><tr><th>40009 값</th><th>의미</th><th>PLC가 할 일</th></tr></thead><tbody>
+ <tr><td class="v">0</td><td>대기 — 이전 명령이 끝남</td><td>새 명령을 쓸 수 있음</td></tr>
+ <tr><td class="v">1~4</td><td>명령이 쓰였지만 장치가 아직 읽지 않음 (보통 0.2초 안에 바뀜)</td><td>기다림</td></tr>
+ <tr><td class="v">101~104</td><td>그 명령을 실행하는 중. 1·2번은 판이 비기를 최대 2초 기다린 뒤 약 3초 동안 배경을 학습 (이 동안에도 통신은 정상 응답)</td><td>기다림. 이 동안의 판정 결과로 새 물체를 판단하지 않음</td></tr>
+ <tr><td class="v">201~204</td><td>그 명령이 실패해서 <b>아무것도 바뀌지 않음</b>. 이유는 웹 '감지 기록'의 [명령] 줄 (판 위 물체, 카메라 오류 등)</td><td>원인을 없앤 뒤 명령을 다시 쓰거나, 0을 써서 표시를 지움</td></tr>
+ <tr><td class="v">299</td><td>지원하지 않는 값을 씀</td><td>PLC 프로그램의 명령 값 확인 후 0을 씀</td></tr>
+ </tbody></table></div>
+ <pre style="margin-top:8px">[명령 보내기]  40009가 0(또는 2xx)일 때 FC06으로 40009(오프셋 8)에 명령 값을 한 번 쓰기
+[끝 기다리기]  40009를 계속 읽어서
+                 0       → 완료 (1·3이면 이후 감지 횟수는 1부터 다시 셈)
+                 101~104 → 실행 중, 계속 기다림
+                 201~204 → 실패: 판을 비우는 등 원인을 없애고 다시 명령
+               시간 초과는 10초 정도로 (1·2번: 최대 2초 대기 + 약 3초 학습)
+프레임 예 (슬레이브 6):  명령 1 쓰기  06 06 00 08 00 01 C8 7F
+                         0 쓰기      06 06 00 08 00 00 09 BF
+                         40009 읽기  06 03 00 08 00 01 04 7F</pre>
+ <ul class="note">
+ <li>명령은 <b>한 번만</b> 쓰세요. 매 스캔마다 계속 쓰면 끝날 때마다 다시 실행됩니다.</li>
+ <li>40001~40009를 FC16으로 한꺼번에 쓰지 마세요. 40009에 들어간 값이 명령으로 실행되고, 결과 레지스터도 덮어써집니다.</li>
+ <li>실행 중에 다른 명령을 쓰면, 판이 비기를 기다리던 1·2번은 취소되고 새 명령이 실행됩니다. 배경 학습(약 3초) 도중이면 학습이 끝난 뒤 새 명령이 실행됩니다.</li>
+ <li>초기화해도 학습 데이터(샘플), Wi-Fi·통신 설정, 통신 통계는 지워지지 않습니다.</li>
+ <li>1·2번은 판 위에 물체가 보이면 실행하지 않습니다(물체가 배경이 되는 것을 막기 위함). 웹 버튼으로 실행했는데 물체가 없는데도 거부되면 '그래도 실행'을 고를 수 있습니다.</li>
+ </ul>
+ </details>
 </section>
 <section class="card">
  <h2>통신 상태</h2>
@@ -1658,7 +1921,7 @@ const REGS=[
  ['B 값',v=>'〃'],
  ['감지 누적 횟수',v=>'새 물체가 확정될 때마다 +1 (값이 바뀌면 새 데이터)'],
  ['길이비 ×100',v=>'추정 길이 ÷ 35mm = '+(v/100).toFixed(2)+` (약 ${Math.round(v*0.35)}mm)`],
- ['명령',v=>({0:'0 = 대기',1:'1 = 배경 재학습 요청',2:'2 = 재학습 진행 중'})[v]??String(v)],
+ ['명령 / 상태',v=>cmdText(v)],
 ];
 const tb=$('regs');
 REGS.forEach((r,i)=>{const tr=document.createElement('tr');
@@ -1708,6 +1971,7 @@ function render(j){
   else if(m.requests>m.ok)hint='오류 응답은 없는 주소(오프셋 9 이후 = 40010/30010 이후)나 지원하지 않는 함수 코드(FC03·FC04·FC06·FC16 외)를 요청했을 때 생깁니다.';
  }
  $('mbHint').textContent=hint;
+ renderCmd(j.cmd);
  const cam=j.camera,w=j.wifi;
  kv($('sysKv'),[
   ['카메라',cam.ok?`<span class="pill ok">정상</span> ${PIDS[cam.pid]||''} (PID 0x${cam.pid.toString(16).toUpperCase()})`:'<span class="pill bad">초기화 실패</span> 배선/전원 확인 후 재부팅'],
@@ -1787,13 +2051,13 @@ async function pollLog(){
 // ---------- 학습 데이터 수집 ----------
 const SZS=['-','소','중','대'],CLS=['-','흰','검','빨','노','초','파'];
 COLORS.slice(1).forEach((n,i)=>{const b=document.createElement('button');b.innerHTML=`<span class="dot" style="background:${SW[i+1]}"></span>${n.replace('색','')}`;b.onclick=()=>learn('c',i+1);$('lnColors').appendChild(b);});
-// 학습 모드 토글: 기본은 숨김(현장 운용 화면). 켜고 끈 상태는 이 브라우저에 기억된다
+// 학습 모드 토글: 페이지를 열 때마다 꺼진 상태(숨김, 현장 운용 화면)로 시작한다. 켠 상태는 기억하지 않는다
 let lnOn=false,lnSamples=0;
-try{lnOn=localStorage.getItem('learnUI')==='1';}catch(e){}
+try{localStorage.removeItem('learnUI');}catch(e){}   // 예전 펌웨어가 브라우저에 남긴 '켜짐' 기억 지우기
 function lnTogLabel(){const t=$('lnTog');t.classList.toggle('on',lnOn);
  t.textContent=lnOn?'학습 모드 끄기':(lnSamples>0?`학습 모드 (샘플 ${lnSamples}개)`:'학습 모드');}
 function lnApply(){$('lnCard').hidden=!lnOn;lnTogLabel();if(lnOn)lnLoad();}
-function lnToggle(){lnOn=!lnOn;try{localStorage.setItem('learnUI',lnOn?'1':'0');}catch(e){}lnApply();}
+function lnToggle(){lnOn=!lnOn;lnApply();}
 let lnBusy=false;
 function lnButtons(dis){document.querySelectorAll('.lrow button').forEach(b=>b.disabled=dis);}
 async function learn(k,v){
@@ -1840,7 +2104,43 @@ async function lnLoad(){
     `<td><a href="/sample.bmp?id=${s.id}&k=raw" target="_blank">원본</a> <a href="/sample.bmp?id=${s.id}&k=mask" target="_blank">마스크</a></td><td><button onclick="lnDel('id=${s.id}','샘플 #${s.id}을 삭제할까요?')">삭제</button></td></tr>`;}).join('');
  }catch(e){}
 }
-function relearn(){if(!confirm('판 위의 물체를 모두 치웠나요? 배경을 다시 학습합니다.'))return;fetch('/relearn').then(r=>r.text()).then(t=>alert(t));}
+// PLC 명령 (40009) — 펌웨어 '14-2. PLC 명령'과 같은 값
+const CMDS={1:'초기화',2:'배경 재학습',3:'감지 결과 초기화',4:'다시 판정'};
+function cmdText(v){
+ if(v==0)return '0 = 대기 (명령을 쓸 수 있음) / 명령값은 아래 패널 참조';
+ if(v>=1&&v<=4)return `${v} = ${CMDS[v]} 명령이 쓰임 (곧 실행)`;
+ if(v>=101&&v<=104)return `${v} = ${CMDS[v-100]} 실행 중`;
+ if(v>=201&&v<=204)return `${v} = ${CMDS[v-200]} 실패 (0을 쓰면 지워짐)`;
+ if(v==299)return '299 = 지원하지 않는 값을 씀';
+ return String(v);}
+const CMD_ASK={1:'판 위를 비웠나요?\n배경을 다시 학습하고, 감지 결과와 누적 감지 횟수를 0으로 만듭니다 (약 3초).',
+ 2:'판 위를 비웠나요?\n배경을 다시 학습합니다 (약 3초). 감지 결과와 누적 감지 횟수는 그대로입니다.',
+ 3:'감지 결과(40001~40008)와 누적 감지 횟수를 0으로 만듭니다.\n판 위에 물체가 있으면 #1로 다시 판정됩니다.',
+ 4:'판 위 물체를 처음부터 다시 판정합니다.\n새 결과는 누적 감지 횟수 +1로 나옵니다.'};
+let cmdWait=null;
+async function cmd(c,force){
+ if(!force&&!confirm(CMD_ASK[c]))return;
+ try{
+  const j=await(await fetch(`/cmd?c=${c}${force?'&force=1':''}`,{cache:'no-store'})).json();
+  if(!j.ok){$('cmdMsg').textContent=j.error;return;}
+  cmdWait={c,seq:j.seq};
+  $('cmdMsg').textContent=`${c} ${CMDS[c]} 요청함${force?' (판 확인 없이)':''} — 진행 상태는 위에 표시됩니다`;
+ }catch(e){$('cmdMsg').textContent='장치 응답 없음';}
+}
+function renderCmd(k){
+ if(!k)return;
+ const r=k.reg,PH=['','실행 중','완료','실패'];
+ pill($('cmdPill'),r==0?'대기':(r<=4?'명령 쓰임':(r<200?'실행 중':'실패')),r==0?'':(r<200?'warn':'bad'));
+ const rows=[['40009 현재 값',cmdText(r)]];
+ if(k.code)rows.push(['마지막 명령',`${k.code} ${k.name} — <b>${PH[k.phase]}</b> · ${k.web?'웹':'PLC'}에서 · ${k.phase==1?ago(k.ago)+' 시작':ago(k.ago)}${k.dur>=0?` · ${(k.dur/1000).toFixed(1)}초 걸림`:''}`]);
+ if(k.msg)rows.push(['내용',k.msg]);
+ kv($('cmdKv'),rows);
+ if(cmdWait&&k.seq!==cmdWait.seq&&k.code==cmdWait.c&&k.phase>=2){
+  const w=cmdWait;cmdWait=null;$('cmdMsg').textContent='';
+  if(k.phase==3&&k.byObject&&confirm(`판 위에 물체가 보여서 '${CMDS[w.c]}'을(를) 실행하지 않았습니다.\n\n물체가 정말 없는데 조명 얼룩·반사 때문에 그렇게 보이는 것이라면 '확인'을 눌러 판 확인 없이 실행합니다.\n(물체가 있는 채로 배경을 학습하면 그 물체가 배경이 됩니다)`))cmd(w.c,true);
+ }
+}
+function relearn(){cmd(2);}
 $('s').src='http://'+location.hostname+':81/stream';
 pollStatus();pollLog();lnApply();setInterval(()=>{if(lnOn)lnLoad();},10000);
 </script></body></html>)rawliteral";
@@ -1894,7 +2194,7 @@ static size_t jsonAppend(char *buf, size_t cap, size_t n, const char *fmt, ...) 
 }
 
 static esp_err_t status_handler(httpd_req_t *req) {
-  static char json[4096];
+  static char json[5120];
   const size_t cap = sizeof(json);
   DebugStatus st;
   if (xSemaphoreTake(dbgMutex, pdMS_TO_TICKS(200)) != pdTRUE) return httpd_resp_send_500(req);
@@ -1957,7 +2257,20 @@ static esp_err_t status_handler(httpd_req_t *req) {
     (unsigned long)req_n, (unsigned long)mbOkCount, req_n ? (long)(now - lastReq) : -1L,
     (unsigned)mbLastFc, (unsigned)mbLastAddr, (unsigned)mbLastArg, mbLastOk ? "true" : "false");
   for (int i = 0; i < REG_COUNT; i++) n = jsonAppend(json, cap, n, "%s%u", i ? "," : "", (unsigned)regMirror[i]);
-  n = jsonAppend(json, cap, n, "]}}");
+  n = jsonAppend(json, cap, n, "]}");
+
+  // PLC 명령 (40009): 현재 값과 마지막 명령 결과
+  CmdState cs;
+  portENTER_CRITICAL(&cmdMux);
+  cs = cmdSt;
+  portEXIT_CRITICAL(&cmdMux);
+  long dur = cs.endMs ? (long)(cs.endMs - cs.startMs) : (cs.phase == 1 ? (long)(now - cs.startMs) : -1L);
+  n = jsonAppend(json, cap, n,
+    ",\"cmd\":{\"reg\":%u,\"seq\":%lu,\"code\":%u,\"name\":\"%s\",\"phase\":%u,\"web\":%s,\"byObject\":%s,"
+    "\"ago\":%ld,\"dur\":%ld,\"waitEmptyMs\":%lu,\"msg\":\"%s\"}}",
+    (unsigned)regMirror[REG_COMMAND], (unsigned long)cs.seq, (unsigned)cs.code, cmdName(cs.code), (unsigned)cs.phase,
+    cs.fromWeb ? "true" : "false", cs.byObject ? "true" : "false",
+    cs.code ? (long)(now - (cs.endMs ? cs.endMs : cs.startMs)) : -1L, dur, CMD_EMPTY_WAIT_MS, cs.msg);
   if (n >= cap) return httpd_resp_send_500(req);
 
   httpd_resp_set_type(req, "application/json; charset=utf-8");
@@ -2000,8 +2313,9 @@ static esp_err_t raw_bmp_handler(httpd_req_t *req) {
   return res;
 }
 
+// 예전 주소 호환: 명령 2(배경 재학습)를 판 확인 없이 실행 — 사람이 화면을 보고 누르는 경우
 static esp_err_t relearn_handler(httpd_req_t *req) {
-  relearnRequested = true;
+  webCommand(CMD_RELEARN, true);
   httpd_resp_set_type(req, "text/plain; charset=utf-8");
   return httpd_resp_send(req, "배경 재학습을 시작합니다 (약 3초). 판이 비어 있어야 합니다.", HTTPD_RESP_USE_STRLEN);
 }
@@ -2207,6 +2521,28 @@ static char *samplesJson(bool full, size_t *outLen) {
   if (n >= cap) { free(o); return nullptr; }
   *outLen = n;
   return o;
+}
+
+// /cmd?c=1..4[&force=1]: PLC가 40009에 쓰는 것과 같은 명령. 바로 응답하고, 결과는 /status의 cmd로 확인
+//   force=1: 명령 1·2에서 '판이 비었나' 확인을 건너뜀 (물체가 없는데 조명 얼룩 등으로 거부될 때 사람이 판단해서)
+static esp_err_t cmd_handler(httpd_req_t *req) {
+  int c = queryInt(req, "c", 0);
+  bool force = queryInt(req, "force", 0) == 1;
+  char out[160];
+  if (c < 1 || c > CMD_MAX) {
+    snprintf(out, sizeof(out), "{\"ok\":false,\"error\":\"명령은 1~%d 입니다\"}", CMD_MAX);
+  } else {
+    uint32_t seq;
+    portENTER_CRITICAL(&cmdMux);
+    seq = cmdSt.seq;
+    portEXIT_CRITICAL(&cmdMux);
+    webCommand(c, force);
+    snprintf(out, sizeof(out), "{\"ok\":true,\"code\":%d,\"name\":\"%s\",\"force\":%s,\"seq\":%lu}", c, cmdName(c),
+             force ? "true" : "false", (unsigned long)seq);
+  }
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
 }
 
 // /learn?s=1..3 (크기) 또는 /learn?c=1..6 (색상): 메인 루프가 확정 상태 프레임에서 저장할 때까지 기다린다
@@ -2432,6 +2768,7 @@ void startWebServers() {
     {.uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL},
     {.uri = "/raw.bmp", .method = HTTP_GET, .handler = raw_bmp_handler, .user_ctx = NULL},
     {.uri = "/relearn", .method = HTTP_GET, .handler = relearn_handler, .user_ctx = NULL},
+    {.uri = "/cmd", .method = HTTP_GET, .handler = cmd_handler, .user_ctx = NULL},
     {.uri = "/wifiscan", .method = HTTP_GET, .handler = wifiscan_handler, .user_ctx = NULL},
     {.uri = "/learn", .method = HTTP_GET, .handler = learn_handler, .user_ctx = NULL},
     {.uri = "/samples", .method = HTTP_GET, .handler = samples_handler, .user_ctx = NULL},
@@ -2783,24 +3120,9 @@ void loop() {
     mbLock();
     for (int i = 0; i < REG_COUNT; i++) regMirror[i] = mb.Hreg(i);
     mbUnlock();
-    if (regMirror[REG_COMMAND] == 1) {
-      setReg(REG_COMMAND, 2);
-      relearnRequested = true;
-      EVENT("[485] PLC 명령: 배경 재학습 (40009 = 1)");
-    }
   }
+  pollCommand();   // 40009 명령 접수 (PLC 또는 웹)
   networkTask();
-
-  if (relearnRequested) {
-    relearnRequested = false;
-    if (cameraOk) {
-      EVENT("[BG] 배경 재학습 시작...");
-      learnBackground(true);
-    } else {
-      EVENT("[BG] 카메라 초기화 실패 상태라 재학습할 수 없음");
-    }
-    setReg(REG_COMMAND, 0);
-  }
 
   if (cameraOk) {
     camera_fb_t *fb = esp_camera_fb_get();
@@ -2813,6 +3135,7 @@ void loop() {
       camFails = camFails + 1;
     }
   }
+  servicePendingCommand();   // 명령 1·2: 판이 비었으면 배경 재학습 (약 3초 동안 여기서 머묾, 그동안도 Modbus는 응답)
   if (millis() - fpsT0 >= 1000) {
     fps = fpsFrames * 1000.0f / (millis() - fpsT0);
     fpsFrames = 0;
