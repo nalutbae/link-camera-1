@@ -5,6 +5,7 @@
 #include <ESPmDNS.h>
 #include <stdarg.h>
 #include <new>
+#include <Preferences.h>
 #include "esp_camera.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
@@ -17,7 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-#define FW_VERSION "2026.11.23"         // 웹 화면·/status에 표시 (장치가 여러 대일 때 어떤 펌웨어인지 구분)
+#define FW_VERSION "2026.11.26"         // 웹 화면·/status에 표시 (장치가 여러 대일 때 어떤 펌웨어인지 구분)
 
 // ==========================================
 // 1. 운용 모드 스위치 (둘 다 켜도 됨)
@@ -76,10 +77,11 @@ const unsigned long MB_LINK_TIMEOUT_MS = 5000;   // 이 시간 동안 요청이 
 #define REG_G_VAL       4       // 40005: G 값
 #define REG_B_VAL       5       // 40006: B 값
 #define REG_DETECT_CNT  6       // 40007: 새 물체 감지 누적 횟수
-#define REG_RATIO_X100  7       // 40008: 길이비 x 100 = 추정 길이 ÷ 35mm (예: 157 = 약 55mm). 소≈100, 중≈157, 대≈243
+#define REG_RATIO_X100  7       // 40008: 길이비 x 100 = 추정 길이 ÷ 35mm (예: 157 = 약 55mm). 소≈100, 중≈157, 대≈214
 #define REG_COMMAND     8       // 40009: 명령/상태. PLC가 명령 코드(1~4)를 쓰면 실행 → 100+N(실행 중) → 0(완료) 또는 200+N(실패)
                                 //        명령 목록과 상태 값은 '14-2. PLC 명령' 참고
-#define REG_COUNT       9
+#define REG_HOLD_MS     9       // 40010: 확정 후 판정 잠금 시간(ms, 0~60000). PLC가 읽고 쓸 수 있음. '7-1. 확정 후 잠금' 참고
+#define REG_COUNT       10
 
 // LOG   : 매 프레임 상세 로그 — 시리얼 전용
 // EVENT : 감지/제거/통신 등 주요 이벤트 — 시리얼 + 웹 '감지 기록'
@@ -114,28 +116,49 @@ const int MIN_BLOB_AREA = 150;       // 물체로 인정할 최소 덩어리 면
 // 가장 큰 덩어리가 MIN_BLOB_AREA/2 보다 작으면 '빈 판'으로 본다
 
 // 검정 물체 보강
-//   3D 프린팅 면이 빛을 반사해 검정 윗면이 판 밝기의 50~80%(회색)로 찍히면 위의 그림자 필터에 지워져
-//   물체가 일부(진한 옆면·모서리)만 잡힌다. 검정으로 판정된 덩어리에는 그림자 필터 없이 다시 본 전경 중
-//   '같은 열(좌우 BLACK_GROW_COLS 안)에서 덩어리 바닥보다 위'인 픽셀만 붙인다.
-//   카메라 쪽 옆면은 빛을 못 받아 늘 진하게 잡히므로, 그보다 아래(카메라 쪽)에 생기는 진짜 그림자는 붙지 않는다.
+//   3D 프린팅 면이 빛을 반사해 검정 윗면·옆면이 판 밝기의 50~80%(회색)로 찍히면 위의 그림자 필터에 지워져
+//   물체가 일부(진한 면·모서리)만 잡힌다. 검정으로 판정된 덩어리에는 그림자 필터 없이 다시 본 전경 중
+//   '같은 열(좌우 BLACK_GROW_COLS 안)에서 덩어리 바닥 + 판별 기준의 below(px)보다 위'인 픽셀만 붙인다.
+//   below는 빛을 받아 회색으로 보이는 카메라 쪽 옆면까지 덮는 폭이고, 그보다 아래(카메라 쪽) 그림자는 붙지 않는다.
 const int BLACK_GROW_COLS = 8;
 
 // ==========================================
-// 5. 크기 판별 — 원근 보정 + 옆면 제거 + 최소 외접 사각형
+// 5. 크기·색 판별 기준 (프로필) — 원근 보정 + 옆면 제거 + 최소 외접 사각형
 // ==========================================
-//  학습 샘플 30개(흰·빨·검 × 소·중·대, 여러 위치·방향)로 맞춘 값. 다시 맞추기: tools/size_check.py
 //  카메라가 비스듬히 내려다보기 때문에
 //   (1) 세로가 가로보다 짧게, 판 안쪽(화면 위)일수록 작게 찍힌다 → '원근 보정 좌표'로 바꿔서 잰다
-//   (2) 카메라 쪽 옆면(높이 35mm)이 물체 아래쪽에 붙어 보인다 (흰색은 옆면이 판과 비슷한 회색이라 안 잡힘)
+//   (2) 카메라 쪽 옆면(높이 35mm)이 물체 아래쪽에 붙어 보인다. 얼마나 붙는지는 색·판 색·조명에 따라 다르다
 //       → 여러 방향의 폭에서 옆면이 늘린 만큼(아래 방향 성분)을 빼고, 가장 작은 외접 사각형 = 윗면으로 본다
-//  예전 방식(긴변/짧은변 비율)은 옆면 때문에 가로로 놓인 중형을 소형으로, 비스듬한 대형을 중형으로 봤다.
-//  샘플 측정 길이: 소 34~44mm, 중 50~56mm, 대 62~87mm → 경계는 그 사이
-const float SIZE_PERSP_P       = 0.00203f; // 원근: 행 y의 확대율 g = 1 / (1 + P·(y - 60))
-const float SIZE_Y_SCALE       = 1.1432f;  // 세로 축척 (기울어져서 세로가 짧게 찍힘)
-const float SIZE_PX_PER_35MM   = 31.48f;   // 보정 좌표에서 35mm(단면 폭)의 길이
-const float SIDE_FACE_PX       = 10.0f;    // 옆면이 같이 잡히는 물체(흰색 외)의 옆면 두께 (보정 좌표)
-const float SIZE_SMALL_MAX_MM  = 47.0f;    // 추정 길이 < 47mm → 소(35mm)
-const float SIZE_MEDIUM_MAX_MM = 58.5f;    // 47~58.5mm → 중(55mm), 그 이상 → 대(85mm)
+//  이 값들은 카메라 위치·판 색·조명이 바뀌면 달라지므로 '판별 기준'으로 묶어 고를 수 있게 했다.
+//   학습 1: samples.zip (은색 판, 처음 카메라 위치) — 30개 30/30
+//   학습 2: samples_2.zip (노란 테이프 판, 옮긴 카메라 위치) — 38개 38/38 (5겹 교차검증 113/114) ← 기본
+//   현장 학습: 웹 학습 모드에서 모은 샘플로 장치가 직접 계산해 저장한 기준 (14-3)
+//  다시 맞추기(PC): tools/size_check.py --fit / 장치에서: 웹 학습 모드 → '학습 데이터로 기준 계산'
+struct Profile {
+  char  name[40];
+  float perspP;          // 원근: 행 y의 확대율 g = 1 / (1 + P·(y - 60))
+  float yScale;          // 세로 축척 (기울어져서 세로가 짧게 찍힘)
+  float pxPer35;         // 보정 좌표에서 35mm(단면 폭)의 길이
+  float sideW, sideK, sideC;   // 옆면 두께(보정 좌표): 흰색 / 검정 / 유채색
+  int   below;           // 검정 보강: 덩어리 바닥 아래로 붙일 수 있는 픽셀 수
+  float smallMax;        // 추정 길이 < smallMax → 소
+  float mediumMax;       //            < mediumMax → 중, 그 이상 → 대
+  float wbSplit;         // 무채색 물체: (평균 밝기 / 판 밝기) ≥ wbSplit → 흰색, 미만 → 검정
+};
+#define PROF_BUILTIN_N 2
+const Profile PROFILE_BUILTIN[PROF_BUILTIN_N] = {
+  //  이름                      P         K        35mm    옆면 흰  검      색     아래 소/중   중/대   흰/검
+  {"학습 1 (samples.zip)",   0.00203f, 1.1432f, 31.48f,  0.00f, 10.00f, 10.00f, 0,  47.0f, 58.5f, 1.20f},
+  {"학습 2 (samples_2.zip)", 0.00153f, 1.2511f, 32.19f, 13.21f, 19.34f,  3.20f, 10, 46.3f, 64.2f, 1.07f},
+};
+#define PROF_CUSTOM  2            // 현장 학습 (장치에서 계산, 전원이 꺼져도 유지)
+#define PROF_DEFAULT 1            // 학습 2
+Profile prof = PROFILE_BUILTIN[PROF_DEFAULT];   // 지금 쓰는 기준 — 메인 루프만 바꾼다 (applyProfile)
+int profIndex = PROF_DEFAULT;
+Profile profView = PROFILE_BUILTIN[PROF_DEFAULT];   // 웹·계산 태스크가 읽는 사본 (profMux 안에서 복사)
+portMUX_TYPE profMux = portMUX_INITIALIZER_UNLOCKED;
+
+const float SIZE_NOMINAL_MM[4] = {0, 35.0f, 55.0f, 75.0f};   // 소·중·대 길이 (단면은 모두 35mm)
 const float SIZE_RECHECK_MM    = 3.0f;     // 확정 후 길이가 경계를 이만큼 넘어 다르게 보이면 다시 판정
 const int   SIZE_CALIPER_STEP  = 3;        // 외접 사각형을 찾는 각도 간격(도)
 
@@ -145,8 +168,7 @@ const int   SIZE_CALIPER_STEP  = 3;        // 외접 사각형을 찾는 각도 
 const int   PX_CHROMA_MIN     = 25;    // 유채색 픽셀: 최대-최소 ≥ 25
 const float PX_SAT_MIN        = 0.28f; //              그리고 채도(S) ≥ 0.28
 const float CHROMA_SHARE_MIN  = 0.35f; // 내부 픽셀 중 유채색이 35% 이상이면 유채색 물체
-const float WHITE_BLACK_SPLIT = 1.2f;  // 무채색 물체: (평균 밝기 / 판 밝기) ≥ 1.2 → 흰색, 미만 → 검정
-                                       //   샘플: 흰 2.3~2.6, 검 0.44~0.66 (반사로 회색이 된 검정 윗면 때문에 0.65는 너무 높았음)
+// 흰/검 경계(밝기비)는 판별 기준의 wbSplit. 샘플: 흰 2.3~2.6, 검 0.35~0.66
 // 색상각(Hue) 경계
 const float HUE_RED_FROM   = 335.0f;   // 335~360, 0~28 → 빨강
 const float HUE_YELLOW_FROM = 28.0f;   // 28~68 → 노랑
@@ -174,6 +196,21 @@ const float         CHANGE_OVERLAP_MIN = 0.5f;   // 현재 덩어리가 풋프�
 const float         CHANGE_AREA_PCT    = 0.25f;  // |면적 차| / 큰 쪽 면적 ≥ 25% → 크기가 다름 (소:중:대 ≈ 1:1.57:2.43)
 const int           CHANGE_FRAMES      = 10;     // 이만큼 연속으로 (안정된 상태로) 달라 보여야 교체
 const unsigned long CHANGE_MIN_MS      = 600;
+
+// ==========================================
+// 7-1. 확정 후 잠금 (판정 정지)
+// ==========================================
+//  확정 직후에는 로봇·손이 물체를 집어 옮기는 움직임이 있다. 그 사이에 움직이는 물체·팔을 새 물체로 잘못 판정하지 않도록
+//  확정 순간부터 holdMs 동안은 새 색상·크기 판정(안정화 시작, 다른 물체로 교체, 크기 다시 판정)을 하지 않는다.
+//  - 물체를 치우면 40003(물체 있음)은 잠금 중에도 0이 된다 (판 상태 알림은 계속)
+//  - 잠금이 끝나도 바로 판정하지 않고, 평소처럼 물체가 멈춰 있어야(안정화) 확정한다 → 움직임이 이어지면 판정도 계속 미뤄짐
+//  - PLC 명령 1~4(초기화·재학습·결과 초기화·다시 판정)는 잠금을 바로 풀고 실행한다
+//  - 시간은 40010(ms)을 PLC가 쓰거나 웹 '판별 설정'에서 바꾼다. 0 = 잠금 없음. 전원이 꺼져도 유지(NVS)
+const uint16_t HOLD_MS_DEFAULT = 5000;
+const uint16_t HOLD_MS_MAX     = 60000;
+uint16_t holdMs = HOLD_MS_DEFAULT;
+bool     holdOn = false;
+unsigned long holdStartMs = 0;
 
 // 조명 변화를 따라가도록 배경을 천천히 갱신 (모든 상태에서)
 //   배경과 차이가 작은 픽셀만 갱신하므로 물체·그림자·손은 배경에 흡수되지 않는다.
@@ -223,7 +260,6 @@ uint8_t  *fgRaw = nullptr;   // 원시 전경 비트: 1 = 전경(그림자 필�
 uint8_t  *fgMap = nullptr;   // 0:배경 1:전경 2:다른 덩어리 3:선택 덩어리 가장자리 4:검정 보강 10+n:선택 덩어리 내부(n=픽셀 분류)
 uint16_t *bfsQueue = nullptr;
 uint8_t  *measMask = nullptr;   // 크기 측정용 마스크 (선택 덩어리 + 검정 보강 → 열림 → 가장 큰 덩어리)
-uint8_t  *measTmp = nullptr;
 
 struct BlobInfo {
   int   area = 0;
@@ -484,17 +520,17 @@ const char* getSizeName(uint16_t code) {
   switch (code) {
     case 1: return "소(35mm)";
     case 2: return "중(55mm)";
-    case 3: return "대(85mm)";
+    case 3: return "대(75mm)";
     default: return "미판별";
   }
 }
 
-// 추정 길이(mm) → 크기 코드
+// 추정 길이(mm) → 크기 코드 (경계는 지금 판별 기준의 값)
 uint16_t classifySizeByLen(float mm) {
   if (mm <= 0) return 0;
-  if (mm < SIZE_SMALL_MAX_MM) return 1;    // 소 (35×35×35)
-  if (mm < SIZE_MEDIUM_MAX_MM) return 2;   // 중 (35×35×55)
-  return 3;                                // 대 (35×35×85)
+  if (mm < prof.smallMax) return 1;    // 소 (35×35×35)
+  if (mm < prof.mediumMax) return 2;   // 중 (35×35×55)
+  return 3;                            // 대 (35×35×75)
 }
 
 // 확정된 크기와 '확실히' 다른 길이인가 (경계 근처에서 흔들리는 값으로는 다시 판정하지 않는다)
@@ -502,9 +538,9 @@ static bool sizeClearlyDiffers(float mm, uint16_t code) {
   if (mm <= 0 || code == 0) return false;
   const float m = SIZE_RECHECK_MM;
   switch (code) {
-    case 1: return mm >= SIZE_SMALL_MAX_MM + m;
-    case 2: return mm < SIZE_SMALL_MAX_MM - m || mm >= SIZE_MEDIUM_MAX_MM + m;
-    default: return mm < SIZE_MEDIUM_MAX_MM - m;
+    case 1: return mm >= prof.smallMax + m;
+    case 2: return mm < prof.smallMax - m || mm >= prof.mediumMax + m;
+    default: return mm < prof.mediumMax - m;
   }
 }
 
@@ -571,7 +607,14 @@ void resetDetectionState() {
   removeStreak = 0;
   changeCount = 0;
   lastFoot = FootCheck();
+  holdOn = false;              // 확정 후 잠금 해제 (재학습·PLC 명령 3·4)
   setReg(REG_PRESENT, 0);
+}
+
+// 확정 후 잠금 중인가 (7-1). 시간이 지나면 저절로 풀린다
+static bool holdActive() {
+  if (holdOn && millis() - holdStartMs >= holdMs) holdOn = false;
+  return holdOn;
 }
 
 // 반환: 배경을 새로 학습했으면 true
@@ -727,7 +770,7 @@ static void classifyBlobColor(const uint8_t *buf, int count, ColorInfo &ci) {
     uint8_t cls = hueClassOf(r, g, b);
     if (cls == 0) {
       float v = max3f(r, g, b);
-      cls = (v >= plateGray * WHITE_BLACK_SPLIT) ? 1 : 2;
+      cls = (v >= plateGray * prof.wbSplit) ? 1 : 2;
       achroVSum += v;
       achroN++;
     }
@@ -750,7 +793,7 @@ static void classifyBlobColor(const uint8_t *buf, int count, ColorInfo &ci) {
     ci.code = (best == 7) ? 0 : best;
     sr = sum[best][0]; sg = sum[best][1]; sb = sum[best][2]; sn = ci.votes[best];
   } else {
-    ci.code = (ci.vRatio >= WHITE_BLACK_SPLIT) ? 1 : 2;
+    ci.code = (ci.vRatio >= prof.wbSplit) ? 1 : 2;
     sr = sum[1][0] + sum[2][0]; sg = sum[1][1] + sum[2][1]; sb = sum[1][2] + sum[2][2];
     sn = ci.votes[1] + ci.votes[2];
   }
@@ -760,21 +803,17 @@ static void classifyBlobColor(const uint8_t *buf, int count, ColorInfo &ci) {
 // ==========================================
 // 12-1. 크기 측정 (원근 보정 + 옆면 제거 + 최소 외접 사각형)
 // ==========================================
-//  tools/size_check.py 의 measure()와 같은 계산 (학습 샘플로 검증·보정할 때 그 스크립트를 쓴다)
+//  tools/size_check.py 의 analyze()·measure_hull()과 같은 계산 (학습 샘플로 검증·보정할 때 그 스크립트를 쓴다)
+//  분할(검정 보강까지)은 전체 영상 버퍼에서, 그 뒤(열림 → 가장 큰 덩어리 → 볼록 껍질 → 측정)는 ROI 크기 마스크에서 한다.
+//  뒤쪽은 장치에서 기준을 계산할 때(14-3, 저장된 샘플 마스크)도 그대로 쓴다.
 const float IMG_CXF = IMG_W / 2.0f, IMG_CYF = IMG_H / 2.0f;   // 원근 보정 기준점 (영상 중심)
 #define CALIPER_N ((89 / SIZE_CALIPER_STEP) + 1)              // 0°, 3°, … 87°
-static float rowG[IMG_H], rowY[IMG_H], rowHx[IMG_H], rowHy[IMG_H];   // 행별 확대율 · 보정 y · 픽셀 반폭
+#define HULL_MAX  (2 * (ROI_Y1 - ROI_Y0 + 1) + 2)             // 볼록 껍질 후보: 행마다 왼쪽·오른쪽 끝 픽셀
 static float calCos[CALIPER_N], calSin[CALIPER_N];
+uint8_t  *roiMask = nullptr, *roiTmp = nullptr;   // 메인 루프의 측정용 ROI 마스크
+uint16_t *roiQueue = nullptr;
 
 static void initSizeTables() {
-  for (int y = 0; y < IMG_H; y++) {
-    float dv = y - IMG_CYF;
-    float g = 1.0f / (1.0f + SIZE_PERSP_P * dv);
-    rowG[y] = g;
-    rowY[y] = SIZE_Y_SCALE * dv * g;
-    rowHx[y] = 0.5f * g;
-    rowHy[y] = 0.5f * SIZE_Y_SCALE * g * g;
-  }
   for (int k = 0; k < CALIPER_N; k++) {
     float a = k * SIZE_CALIPER_STEP * (float)M_PI / 180.0f;
     calCos[k] = cosf(a);
@@ -782,12 +821,158 @@ static void initSizeTables() {
   }
 }
 
+// 색 판정 코드 → 이 기준의 옆면 두께 (흰 / 검정 / 그 밖의 색)
+static inline float sideFor(uint16_t colorCode, const Profile &p) {
+  return colorCode == 1 ? p.sideW : (colorCode == 2 ? p.sideK : p.sideC);
+}
+
 // 보정 좌표 → 화면 좌표 (디버그 화면에 추정 윗면을 그릴 때)
-static void rectToImg(float X, float Y, float &x, float &y) {
-  float dv = Y / (SIZE_Y_SCALE - SIZE_PERSP_P * Y);
-  float g = 1.0f / (1.0f + SIZE_PERSP_P * dv);
+static void rectToImg(float X, float Y, const Profile &p, float &x, float &y) {
+  float dv = Y / (p.yScale - p.perspP * Y);
+  float g = 1.0f / (1.0f + p.perspP * dv);
   x = IMG_CXF + X / g;
   y = IMG_CYF + dv;
+}
+
+// ---- ROI 크기(W×H) 0/1 마스크용 — 마스크 바깥은 0으로 본다 ----
+
+// 3x3 열림(침식 후 팽창): 배경 가장자리 잡음으로 생긴 1~2px 가는 선·돌기 제거
+static void openRoi(uint8_t *m, uint8_t *tmp, int W, int H) {
+  for (int y = 0; y < H; y++) {
+    for (int x = 0; x < W; x++) {
+      uint8_t v = 1;
+      for (int dy = -1; dy <= 1 && v; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+          int yy = y + dy, xx = x + dx;
+          if (yy < 0 || yy >= H || xx < 0 || xx >= W || !m[yy * W + xx]) { v = 0; break; }
+        }
+      }
+      tmp[y * W + x] = v;
+    }
+  }
+  for (int y = 0; y < H; y++) {
+    for (int x = 0; x < W; x++) {
+      int i = y * W + x;
+      if (!m[i]) continue;
+      uint8_t v = 0;
+      for (int dy = -1; dy <= 1 && !v; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+          int yy = y + dy, xx = x + dx;
+          if (yy >= 0 && yy < H && xx >= 0 && xx < W && tmp[yy * W + xx]) { v = 1; break; }
+        }
+      }
+      m[i] = v;
+    }
+  }
+}
+
+static int floodRoi(uint8_t *m, int W, int H, int seed, uint8_t from, uint8_t to, uint16_t *q) {
+  int head = 0, tail = 0;
+  q[tail++] = seed;
+  m[seed] = to;
+  while (head < tail) {
+    int i = q[head++];
+    int x = i % W, y = i / W;
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        int yy = y + dy, xx = x + dx;
+        if (yy < 0 || yy >= H || xx < 0 || xx >= W) continue;
+        int n = yy * W + xx;
+        if (m[n] == from) { m[n] = to; q[tail++] = n; }
+      }
+    }
+  }
+  return tail;
+}
+
+// 열림으로 떨어져 나간 조각을 버리고 가장 큰 덩어리만 남긴다. 반환: 남은 면적
+static int keepLargestRoi(uint8_t *m, int W, int H, uint16_t *q) {
+  int bestSeed = -1, bestArea = 0;
+  for (int i = 0; i < W * H; i++) {
+    if (m[i] != 1) continue;
+    int a = floodRoi(m, W, H, i, 1, 2, q);
+    if (a > bestArea) { bestArea = a; bestSeed = i; }
+  }
+  if (bestSeed < 0) return 0;
+  floodRoi(m, W, H, bestSeed, 2, 3, q);
+  for (int i = 0; i < W * H; i++) m[i] = m[i] == 3;
+  return bestArea;
+}
+
+// 마스크의 볼록 껍질 꼭짓점 (전체 영상 좌표 = ROI 좌표 + x0/y0). 반환: 꼭짓점 수
+//   외접 사각형의 극값은 볼록 껍질 꼭짓점에서만 나오므로 가장자리 픽셀 전체 대신 이것만 본다 (보통 10~30개)
+static int hullRoi(const uint8_t *m, int W, int H, int x0, int y0, int16_t *hx, int16_t *hy) {
+  int16_t pa[HULL_MAX], pb[HULL_MAX];   // (행, 열) 순으로 정렬된 후보: 행마다 가장 왼쪽·오른쪽 픽셀
+  int n = 0;
+  for (int y = 0; y < H && n + 2 <= HULL_MAX; y++) {
+    int xl = -1, xr = -1;
+    for (int x = 0; x < W; x++) if (m[y * W + x]) { if (xl < 0) xl = x; xr = x; }
+    if (xl < 0) continue;
+    pa[n] = y; pb[n] = xl; n++;
+    if (xr != xl) { pa[n] = y; pb[n] = xr; n++; }
+  }
+  if (n < 3) {
+    for (int i = 0; i < n; i++) { hx[i] = pb[i] + x0; hy[i] = pa[i] + y0; }
+    return n;
+  }
+  // 모노톤 체인 (좌표 순서 (행, 열)). 일직선 위의 점은 버린다
+  int16_t h[2 * HULL_MAX];
+  int k = 0;
+  auto cross = [&](int o, int a, int b) {
+    return (int32_t)(pa[a] - pa[o]) * (pb[b] - pb[o]) - (int32_t)(pb[a] - pb[o]) * (pa[b] - pa[o]);
+  };
+  for (int i = 0; i < n; i++) {
+    while (k >= 2 && cross(h[k - 2], h[k - 1], i) <= 0) k--;
+    h[k++] = i;
+  }
+  for (int i = n - 2, t = k + 1; i >= 0; i--) {
+    while (k >= t && cross(h[k - 2], h[k - 1], i) <= 0) k--;
+    h[k++] = i;
+  }
+  k--;   // 마지막 점 = 첫 점
+  for (int i = 0; i < k; i++) { hx[i] = pb[h[i]] + x0; hy[i] = pa[h[i]] + y0; }
+  return k;
+}
+
+// 크기 측정 결과 (보정 좌표의 외접 사각형 포함 — 디버그 화면에 윗면을 그릴 때)
+struct SizeMeas { float lenMm, widMm, u0, v0, lu, lv; int k; };
+
+// 원근 보정 좌표에서 각도를 바꿔 가며 외접 사각형을 대고, 옆면 몫(side × 아래 방향 성분)을 뺀 넓이가 가장 작은 것 = 윗면
+//   옆면은 윗면을 아래로 side만큼 늘린 모양이라, 어느 방향의 폭에서든 'side × 그 방향의 세로 성분'만큼만 커진다.
+static bool measureHull(const int16_t *hx, const int16_t *hy, int n, float side, float P, float K, float px35,
+                        SizeMeas &o) {
+  if (n < 3) return false;
+  float g[HULL_MAX];
+  for (int i = 0; i < n; i++) g[i] = 1.0f / (1.0f + P * (hy[i] - IMG_CYF));
+  float bestA = 1e30f;
+  o.k = 0; o.u0 = o.v0 = 0; o.lu = o.lv = 1.0f;
+  for (int k = 0; k < CALIPER_N; k++) {
+    float c = calCos[k], s = calSin[k];
+    float u0 = 1e9f, u1 = -1e9f, v0 = 1e9f, v1 = -1e9f;
+    for (int i = 0; i < n; i++) {
+      float X = (hx[i] - IMG_CXF) * g[i], Y = K * (hy[i] - IMG_CYF) * g[i];
+      float ex = 0.5f * g[i], ey = 0.5f * K * g[i] * g[i];   // 픽셀 반폭 (보정 좌표)
+      float pu = X * c + Y * s, pv = -X * s + Y * c;
+      float ru = ex * c + ey * s, rv = ex * s + ey * c;
+      if (pu - ru < u0) u0 = pu - ru;
+      if (pu + ru > u1) u1 = pu + ru;
+      if (pv - rv < v0) v0 = pv - rv;
+      if (pv + rv > v1) v1 = pv + rv;
+    }
+    float lu = max(1.0f, u1 - u0 - side * s), lv = max(1.0f, v1 - v0 - side * c);
+    if (lu * lv < bestA) { bestA = lu * lv; o.k = k; o.u0 = u0; o.v0 = v0; o.lu = lu; o.lv = lv; }
+  }
+  o.lenMm = max(o.lu, o.lv) * 35.0f / px35;
+  o.widMm = min(o.lu, o.lv) * 35.0f / px35;
+  return true;
+}
+
+// ROI 마스크 → 열림 → 가장 큰 덩어리 → 볼록 껍질. 반환: 꼭짓점 수 (0 = 측정할 덩어리 없음)
+static int roiMaskToHull(uint8_t *m, uint8_t *tmp, uint16_t *q, int16_t *hx, int16_t *hy) {
+  const int W = ROI_X1 - ROI_X0 + 1, H = ROI_Y1 - ROI_Y0 + 1;
+  openRoi(m, tmp, W, H);
+  if (keepLargestRoi(m, W, H, q) == 0) return 0;
+  return hullRoi(m, W, H, ROI_X0, ROI_Y0, hx, hy);
 }
 
 struct MBox { int x0, y0, x1, y1; };   // measMask가 들어 있는 범위 (ROI 안)
@@ -807,8 +992,8 @@ static inline bool weakAt(int i) {
   return s >= 5;
 }
 
-// 검정 보강 (BLACK_GROW_COLS 설명 참고): 덩어리에서 시작해 '열별 바닥보다 위'인 약한 전경으로 키운다
-static int growBlack(MBox &bx) {
+// 검정 보강 (BLACK_GROW_COLS 설명 참고): 덩어리에서 시작해 '열별 바닥 + below 보다 위'인 약한 전경으로 키운다
+static int growBlack(MBox &bx, int below) {
   static int16_t colBot[IMG_W], winBot[IMG_W];
   static const int DX[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
   static const int DY[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
@@ -833,7 +1018,7 @@ static int growBlack(MBox &bx) {
       int nx = x + DX[k], ny = y + DY[k];
       if (nx < ROI_X0 || nx > ROI_X1 || ny < ROI_Y0 || ny > ROI_Y1) continue;
       int n = ny * IMG_W + nx;
-      if (measMask[n] || ny > winBot[nx] || !weakAt(n)) continue;
+      if (measMask[n] || winBot[nx] < 0 || ny > winBot[nx] + below || !weakAt(n)) continue;
       measMask[n] = 1;
       bfsQueue[tail++] = n;
       added++;
@@ -844,123 +1029,32 @@ static int growBlack(MBox &bx) {
   return added;
 }
 
-// 3x3 열림(침식 후 팽창): 배경 가장자리 잡음으로 생긴 1~2px 가는 선·돌기 제거
-static void openMask(const MBox &bx) {
-  memset(measTmp, 0, IMG_N);
-  for (int y = bx.y0; y <= bx.y1; y++) {
-    for (int x = bx.x0; x <= bx.x1; x++) {
-      int i = y * IMG_W + x;
-      measTmp[i] = measMask[i - IMG_W - 1] & measMask[i - IMG_W] & measMask[i - IMG_W + 1] &
-                   measMask[i - 1] & measMask[i] & measMask[i + 1] &
-                   measMask[i + IMG_W - 1] & measMask[i + IMG_W] & measMask[i + IMG_W + 1];
-    }
-  }
-  for (int y = bx.y0; y <= bx.y1; y++) {
-    for (int x = bx.x0; x <= bx.x1; x++) {
-      int i = y * IMG_W + x;
-      if (!measMask[i]) continue;
-      measMask[i] = measTmp[i - IMG_W - 1] | measTmp[i - IMG_W] | measTmp[i - IMG_W + 1] |
-                    measTmp[i - 1] | measTmp[i] | measTmp[i + 1] |
-                    measTmp[i + IMG_W - 1] | measTmp[i + IMG_W] | measTmp[i + IMG_W + 1];
-    }
-  }
-}
-
-static int floodMask(int seed, uint8_t from, uint8_t to) {
-  static const int D[8] = {-IMG_W - 1, -IMG_W, -IMG_W + 1, -1, 1, IMG_W - 1, IMG_W, IMG_W + 1};
-  int head = 0, tail = 0;
-  bfsQueue[tail++] = seed;
-  measMask[seed] = to;
-  while (head < tail) {
-    int i = bfsQueue[head++];
-    for (int k = 0; k < 8; k++) {   // ROI 밖은 measMask가 항상 0
-      int n = i + D[k];
-      if (measMask[n] == from) { measMask[n] = to; bfsQueue[tail++] = n; }
-    }
-  }
-  return tail;
-}
-
-// 열림으로 떨어져 나간 조각을 버리고 가장 큰 덩어리만 남긴다. 반환: 남은 면적
-static int keepLargest(MBox &bx) {
-  int bestSeed = -1, bestArea = 0;
-  for (int y = bx.y0; y <= bx.y1; y++) {
-    for (int x = bx.x0; x <= bx.x1; x++) {
-      int i = y * IMG_W + x;
-      if (measMask[i] != 1) continue;
-      int a = floodMask(i, 1, 2);
-      if (a > bestArea) { bestArea = a; bestSeed = i; }
-    }
-  }
-  if (bestSeed < 0) return 0;
-  floodMask(bestSeed, 2, 3);
-  MBox nb = {IMG_W, IMG_H, -1, -1};
-  for (int y = bx.y0; y <= bx.y1; y++) {
-    for (int x = bx.x0; x <= bx.x1; x++) {
-      int i = y * IMG_W + x;
-      measMask[i] = measMask[i] == 3;
-      if (measMask[i]) boxAdd(nb, x, y);
-    }
-  }
-  bx = nb;
-  return bestArea;
-}
-
-// 보정 좌표에서 각도를 바꿔 가며 외접 사각형을 대고, 옆면 몫(side × 아래 방향 성분)을 뺀 넓이가 가장 작은 것 = 윗면
-//   옆면은 윗면을 아래로 side만큼 늘린 모양이라, 어느 방향의 폭에서든 'side × 그 방향의 세로 성분'만큼만 커진다.
-static void caliperMeasure(BlobInfo &b, const MBox &bx, float side) {
-  int ne = 0;   // 가장자리 픽셀만 (극값은 항상 가장자리에서 나온다)
-  for (int y = bx.y0; y <= bx.y1; y++) {
-    for (int x = bx.x0; x <= bx.x1; x++) {
-      int i = y * IMG_W + x;
-      if (measMask[i] && (!measMask[i - 1] || !measMask[i + 1] || !measMask[i - IMG_W] || !measMask[i + IMG_W]))
-        bfsQueue[ne++] = i;
-    }
-  }
-  if (ne < 3) return;
-  float bestA = 1e30f, bU0 = 0, bV0 = 0, bLu = 0, bLv = 0;
-  int bestK = 0;
-  for (int k = 0; k < CALIPER_N; k++) {
-    float c = calCos[k], s = calSin[k];
-    float u0 = 1e9f, u1 = -1e9f, v0 = 1e9f, v1 = -1e9f;
-    for (int e = 0; e < ne; e++) {
-      int i = bfsQueue[e];
-      int x = i % IMG_W, y = i / IMG_W;
-      float X = (x - IMG_CXF) * rowG[y], Y = rowY[y];
-      float pu = X * c + Y * s, pv = -X * s + Y * c;
-      float ru = rowHx[y] * c + rowHy[y] * s, rv = rowHx[y] * s + rowHy[y] * c;
-      if (pu - ru < u0) u0 = pu - ru;
-      if (pu + ru > u1) u1 = pu + ru;
-      if (pv - rv < v0) v0 = pv - rv;
-      if (pv + rv > v1) v1 = pv + rv;
-    }
-    float lu = max(1.0f, u1 - u0 - side * s), lv = max(1.0f, v1 - v0 - side * c);
-    if (lu * lv < bestA) { bestA = lu * lv; bestK = k; bU0 = u0; bV0 = v0; bLu = lu; bLv = lv; }
-  }
-  b.lenMm = max(bLu, bLv) * 35.0f / SIZE_PX_PER_35MM;
-  b.widMm = min(bLu, bLv) * 35.0f / SIZE_PX_PER_35MM;
-  // 추정 윗면 꼭짓점: u ∈ [u0, u0+lu], v ∈ [v0, v0+lv] (옆면은 u·v의 큰 쪽 끝에 붙어 있었음)
-  float c = calCos[bestK], s = calSin[bestK];
-  const float us[4] = {bU0, bU0 + bLu, bU0 + bLu, bU0}, vs[4] = {bV0, bV0, bV0 + bLv, bV0 + bLv};
-  for (int k = 0; k < 4; k++) rectToImg(us[k] * c - vs[k] * s, us[k] * s + vs[k] * c, b.boxX[k], b.boxY[k]);
-}
-
-// 선택 덩어리(fgMap >= 3) → [검정이면 보강] → 열림 → 가장 큰 덩어리 → 윗면 크기(mm)
+// 선택 덩어리(fgMap >= 3) → [검정이면 보강] → ROI 마스크 → 열림 → 가장 큰 덩어리 → 볼록 껍질 → 윗면 크기(mm)
 static void measureSize(BlobInfo &b, const ColorInfo &ci) {
   b.lenMm = b.widMm = 0;
   b.grown = 0;
   b.sideCut = false;
-  if (!measMask || !measTmp || b.area <= 0) return;
+  if (!measMask || !roiMask || !roiTmp || !roiQueue || b.area <= 0) return;
   memset(measMask, 0, IMG_N);
   MBox bx = {b.minX, b.minY, b.maxX, b.maxY};
   for (int y = bx.y0; y <= bx.y1; y++)
     for (int x = bx.x0; x <= bx.x1; x++)
       if (fgMap[y * IMG_W + x] >= 3) measMask[y * IMG_W + x] = 1;
-  if (ci.code == 2) b.grown = growBlack(bx);
-  openMask(bx);
-  if (keepLargest(bx) == 0) return;
-  b.sideCut = ci.code != 1;   // 흰색은 옆면이 잡히지 않는다 (판과 비슷한 회색이라 그림자 필터에 빠짐)
-  caliperMeasure(b, bx, b.sideCut ? SIDE_FACE_PX : 0.0f);
+  if (ci.code == 2) b.grown = growBlack(bx, prof.below);
+  const int W = ROI_X1 - ROI_X0 + 1, H = ROI_Y1 - ROI_Y0 + 1;
+  for (int y = 0; y < H; y++) memcpy(roiMask + y * W, measMask + (y + ROI_Y0) * IMG_W + ROI_X0, W);
+  int16_t hx[HULL_MAX], hy[HULL_MAX];
+  int n = roiMaskToHull(roiMask, roiTmp, roiQueue, hx, hy);
+  float side = sideFor(ci.code, prof);
+  SizeMeas m;
+  if (!measureHull(hx, hy, n, side, prof.perspP, prof.yScale, prof.pxPer35, m)) return;
+  b.sideCut = side > 0;
+  b.lenMm = m.lenMm;
+  b.widMm = m.widMm;
+  // 추정 윗면 꼭짓점: u ∈ [u0, u0+lu], v ∈ [v0, v0+lv] (옆면은 u·v의 큰 쪽 끝에 붙어 있었음)
+  float c = calCos[m.k], s = calSin[m.k];
+  const float us[4] = {m.u0, m.u0 + m.lu, m.u0 + m.lu, m.u0}, vs[4] = {m.v0, m.v0, m.v0 + m.lv, m.v0 + m.lv};
+  for (int k = 0; k < 4; k++) rectToImg(us[k] * c - vs[k] * s, us[k] * s + vs[k] * c, prof, b.boxX[k], b.boxY[k]);
 }
 
 // ==========================================
@@ -1203,7 +1297,8 @@ static void updateState(const BlobInfo &best, const ColorInfo &ci, const FootChe
 
   switch (detState) {
     case ST_EMPTY:
-      if (best.valid) {
+      // 확정 후 잠금 중에는 새 물체 판정을 시작하지 않는다 (치우는 손·로봇과 옮겨지는 물체를 판정하지 않게)
+      if (best.valid && !holdActive()) {
         beginSettling(best, ci);
         LOG("[DBG] 물체 진입: 면적=%d 중심=(%.0f,%.0f)\n", best.area, best.cx, best.cy);
       }
@@ -1236,6 +1331,8 @@ static void updateState(const BlobInfo &best, const ColorInfo &ci, const FootChe
         if (tryConfirm()) {
           detState = ST_CONFIRMED;
           saveFootprint(best);
+          holdOn = holdMs > 0;          // 확정 후 잠금 시작 (7-1)
+          holdStartMs = millis();
           EVENT("[#%u] 색상 %u:%s (R:%d G:%d B:%d) | 크기 %u:%s (추정 길이 %.0fmm)",
                 detectCount, curColorCode, getColorName(curColorCode), curR, curG, curB,
                 curSizeCode, getSizeName(curSizeCode), curLenMm);
@@ -1261,7 +1358,8 @@ static void updateState(const BlobInfo &best, const ColorInfo &ci, const FootChe
       }
 
       // (2) 교체: 판이 비는 순간 없이 같은 자리에 크기/색이 다른 물체가 안정적으로 놓임
-      if (isDifferentObject(best, ci, fc)) {
+      //     확정 후 잠금 중에는 하지 않는다 (집어 옮기는 동안 모양·색이 달라 보여도 다시 판정하지 않게)
+      if (!holdActive() && isDifferentObject(best, ci, fc)) {
         if (changeCount > 0 && isSameBlob(changePrev, best)) {
           changeCount++;
         } else {
@@ -1523,6 +1621,8 @@ struct Sample {
   float    confLenMm = 0;          // 확정에 쓴 추정 길이 (mm)
   int16_t  confRgb[3] = {0};
   uint8_t  frameSize = 0;          // 저장한 프레임 한 장의 추정 길이로 본 크기
+  int8_t   profIdx = -1;           // 저장할 때 쓰던 판별 기준
+  uint8_t  below = 0;              // 그 기준의 검정 보강 아래 폭 (마스크의 보강 픽셀이 이 값으로 만들어짐 — 14-3에서 씀)
   BlobInfo blob;                   // 저장한 프레임의 덩어리 측정값 (좌표는 전체 화면 기준)
   ColorInfo color;
   float    plate[3] = {0}, gain[3] = {0};
@@ -1625,6 +1725,8 @@ static void serviceLearnRequest(const uint8_t *buf, const BlobInfo &best, const 
     s->confLenMm = curLenMm;
     s->confRgb[0] = curR; s->confRgb[1] = curG; s->confRgb[2] = curB;
     s->frameSize = classifySizeByLen(best.lenMm);
+    s->profIdx = profIndex;
+    s->below = prof.below;
     s->blob = best;
     s->color = ci;
     s->plate[0] = plateR; s->plate[1] = plateG; s->plate[2] = plateB;
@@ -1659,6 +1761,339 @@ static void serviceLearnRequest(const uint8_t *buf, const BlobInfo &best, const 
               "\"labelName\":\"%s\",\"predName\":\"%s\",\"lenMm\":%.1f,\"count\":%d}",
               id, merged ? "true" : "false", merged && prevLabel ? "true" : "false", isSize ? "size" : "color",
               label, pred, labelName, predName, lenMm, count);
+}
+
+// ==========================================
+// 14-3. 판별 기준 고르기 · 현장 학습(장치에서 기준 계산) · 설정 저장
+// ==========================================
+//  - 판별 기준은 웹 '판별 설정'에서 고른다 (학습 1 / 학습 2 / 현장 학습). 고른 번호는 전원이 꺼져도 유지(NVS)
+//  - 현장 학습: 웹 학습 모드에서 모은 샘플(크기 라벨 필요)로 원근·옆면 두께·크기 경계·흰/검 경계를 장치가 직접 계산한다.
+//    펌웨어를 다시 올리지 않아도 된다. 계산은 코어 0의 낮은 우선순위 태스크에서 하므로 감지·Modbus는 계속 동작한다.
+//    결과를 보고 '적용'을 누르면 현장 학습 기준으로 저장(NVS)되고 바로 쓰인다. 샘플은 전원이 꺼지면 지워지지만 기준은 남는다.
+//  - 계산 방법은 tools/size_check.py 의 fit_profile() 과 같다 (같은 비용 함수·초기값·Nelder-Mead 순서)
+Preferences nvs;
+bool nvsOk = false;
+Profile profCustom;                 // 현장 학습 기준
+bool profCustomValid = false;
+uint16_t profCustomN = 0;           // 계산에 쓴 샘플 수
+volatile int profRequest = -1;      // 웹 → 메인 루프: 이 번호의 기준으로 바꿔 달라
+
+static const Profile &profileByIndex(int i) { return i == PROF_CUSTOM ? profCustom : PROFILE_BUILTIN[i]; }
+
+// 메인 루프에서만 부른다. 현재 확정된 결과는 그대로 두고, 다음 판정부터 새 기준을 쓴다
+static void applyProfile(int idx, bool save) {
+  if (idx < 0 || idx > PROF_CUSTOM || (idx == PROF_CUSTOM && !profCustomValid)) idx = PROF_DEFAULT;
+  prof = profileByIndex(idx);
+  profIndex = idx;
+  portENTER_CRITICAL(&profMux);
+  profView = prof;
+  portEXIT_CRITICAL(&profMux);
+  if (save && nvsOk) nvs.putUChar("prof", (uint8_t)idx);
+}
+
+// ---- 40010 확정 후 잠금 시간 (PLC가 쓰거나 웹이 씀) ----
+uint16_t holdDevVal = 0;            // 장치가 40010에 마지막으로 쓴 값 — 지금 값이 다르면 새로 쓰인 것
+volatile bool webHoldPending = false;
+
+static uint16_t readReg(int a) { return ENABLE_MODBUS ? mb.Hreg(a) : regMirror[a]; }
+
+static void publishHold() {
+  mbLock();
+  setReg(REG_HOLD_MS, holdMs);
+  holdDevVal = holdMs;
+  mbUnlock();
+}
+
+// 메인 루프마다: 40010에 새 값이 쓰였으면 적용 (0~60000ms, 넘으면 60000)
+static void pollHoldReg() {
+  mbLock();
+  uint16_t v = readReg(REG_HOLD_MS);
+  mbUnlock();
+  if (v == holdDevVal) return;
+  bool web = webHoldPending;
+  webHoldPending = false;
+  holdMs = v > HOLD_MS_MAX ? HOLD_MS_MAX : v;
+  publishHold();
+  if (nvsOk) nvs.putUShort("hold", holdMs);
+  EVENT("[설정] 확정 후 잠금 시간 %.1f초 (%s가 40010에 %u을 씀%s)", holdMs / 1000.0f, web ? "웹" : "PLC", v,
+        v > HOLD_MS_MAX ? ", 최대 60초로 제한" : "");
+}
+
+// ---- 장치에서 기준 계산 ----
+#define FIT_MIN_SAMPLES 9            // 최소 샘플 수 (소·중·대 각 2개 이상도 필요)
+const float FIT_DELTA = 0.08f;       // 의사-Huber 손실의 꺾이는 점 (길이·폭의 로그 오차 약 8%) — 잘못 누른 라벨의 영향을 줄임
+const float FIT_LO[6]   = {-0.01f, 0.8f, 15.0f, 0.0f, 0.0f, 0.0f};
+const float FIT_HI[6]   = {0.02f, 1.6f, 60.0f, 30.0f, 30.0f, 30.0f};
+const float FIT_STEP[6] = {0.002f, 0.05f, 2.0f, 3.0f, 3.0f, 3.0f};
+const int   FIT_MAX_EVALS = 700;
+
+struct FitSample {
+  int16_t n;                         // 볼록 껍질 꼭짓점 수
+  int16_t hx[HULL_MAX], hy[HULL_MAX];
+  uint8_t grp;                       // 옆면 무리: 0 흰, 1 검정, 2 유채색 (저장할 때 장치가 본 색)
+  uint8_t size, colorLabel, below;
+  float   vRatio;
+};
+struct FitData { const FitSample *s; int n; };
+typedef void (*FitYield)();
+
+// 비용: 길이는 명목값(35/55/75mm), 폭은 35mm가 되도록 — x = {P, K, 35mm px, 옆면 흰, 검정, 유채색}
+static float fitCost(const float *x, const FitData &d, FitYield yieldFn) {
+  for (int j = 0; j < 6; j++) if (x[j] < FIT_LO[j] || x[j] > FIT_HI[j]) return 1e9f;
+  float e = 0;
+  for (int i = 0; i < d.n; i++) {
+    const FitSample &s = d.s[i];
+    SizeMeas m;
+    if (!measureHull(s.hx, s.hy, s.n, x[3 + s.grp], x[0], x[1], x[2], m)) return 1e9f;
+    float r[2] = {logf(m.lenMm / SIZE_NOMINAL_MM[s.size]), logf(m.widMm / 35.0f)};
+    for (int k = 0; k < 2; k++) e += FIT_DELTA * FIT_DELTA * (sqrtf(1.0f + (r[k] / FIT_DELTA) * (r[k] / FIT_DELTA)) - 1.0f);
+  }
+  if (yieldFn) yieldFn();
+  return e;
+}
+
+// 표준 Nelder-Mead (반사 1, 확장 2, 수축 0.5, 축소 0.5). x: 시작값 → 결과. 반환: 최소 비용
+static float nelderMead(float *x, const FitData &d, int maxEvals, int *evalsOut, FitYield yieldFn) {
+  const int n = 6;
+  float sp[n + 1][n], fv[n + 1];
+  for (int i = 0; i <= n; i++) {
+    for (int j = 0; j < n; j++) sp[i][j] = x[j] + (i > 0 && j == i - 1 ? FIT_STEP[j] : 0.0f);
+    fv[i] = fitCost(sp[i], d, yieldFn);
+  }
+  int evals = n + 1;
+  while (evals < maxEvals) {
+    for (int i = 1; i <= n; i++) {          // 비용 순으로 정렬 (같으면 원래 순서 유지)
+      float tf = fv[i], tp[n];
+      memcpy(tp, sp[i], sizeof(tp));
+      int j = i - 1;
+      while (j >= 0 && fv[j] > tf) { fv[j + 1] = fv[j]; memcpy(sp[j + 1], sp[j], sizeof(tp)); j--; }
+      fv[j + 1] = tf;
+      memcpy(sp[j + 1], tp, sizeof(tp));
+    }
+    if (fv[n] - fv[0] < 1e-7f) break;
+    float c[n], xr[n], xe[n], xc[n];
+    for (int j = 0; j < n; j++) {
+      c[j] = 0;
+      for (int i = 0; i < n; i++) c[j] += sp[i][j];
+      c[j] /= n;
+      xr[j] = c[j] + (c[j] - sp[n][j]);
+    }
+    float fr = fitCost(xr, d, yieldFn); evals++;
+    if (fr < fv[0]) {
+      for (int j = 0; j < n; j++) xe[j] = c[j] + 2 * (c[j] - sp[n][j]);
+      float fe = fitCost(xe, d, yieldFn); evals++;
+      if (fe < fr) { memcpy(sp[n], xe, sizeof(xe)); fv[n] = fe; }
+      else { memcpy(sp[n], xr, sizeof(xr)); fv[n] = fr; }
+    } else if (fr < fv[n - 1]) {
+      memcpy(sp[n], xr, sizeof(xr)); fv[n] = fr;
+    } else {
+      for (int j = 0; j < n; j++) xc[j] = fr < fv[n] ? c[j] + 0.5f * (xr[j] - c[j]) : c[j] + 0.5f * (sp[n][j] - c[j]);
+      float fc = fitCost(xc, d, yieldFn); evals++;
+      if (fc < min(fr, fv[n])) {
+        memcpy(sp[n], xc, sizeof(xc)); fv[n] = fc;
+      } else {
+        for (int i = 1; i <= n; i++) {
+          for (int j = 0; j < n; j++) sp[i][j] = sp[0][j] + 0.5f * (sp[i][j] - sp[0][j]);
+          fv[i] = fitCost(sp[i], d, yieldFn); evals++;
+        }
+      }
+    }
+  }
+  int k = 0;
+  for (int i = 1; i <= n; i++) if (fv[i] < fv[k]) k = i;
+  memcpy(x, sp[k], sizeof(float) * n);
+  if (evalsOut) *evalsOut += evals;
+  return fv[k];
+}
+
+struct FitInfo {
+  int n = 0, evals = 0, okBefore = 0, okAfter = 0;
+  float cost = 0;
+  float lo[4] = {0}, hi[4] = {0};   // 새 기준으로 잰 크기별 길이 범위 (1 소, 2 중, 3 대)
+  int cnt[4] = {0};
+};
+
+static int fitSizeOf(float mm, const Profile &p) { return mm <= 0 ? 0 : (mm < p.smallMax ? 1 : (mm < p.mediumMax ? 2 : 3)); }
+
+// 샘플로 새 기준 계산 (base에서 시작). 크기 경계는 이웃한 크기의 측정 범위가 나뉘면 그 사이, 겹치면 명목 길이 사이
+static void fitProfile(const FitData &d, const Profile &base, Profile &out, FitInfo &info, FitYield yieldFn) {
+  float x[6] = {base.perspP, base.yScale, base.pxPer35, base.sideW, base.sideK, base.sideC};
+  info = FitInfo();
+  info.n = d.n;
+  for (int i = 0; i < d.n; i++) {     // 지금 기준으로 맞힌 수
+    SizeMeas m;
+    const FitSample &s = d.s[i];
+    float side = s.grp == 0 ? base.sideW : (s.grp == 1 ? base.sideK : base.sideC);
+    if (measureHull(s.hx, s.hy, s.n, side, base.perspP, base.yScale, base.pxPer35, m) && fitSizeOf(m.lenMm, base) == s.size)
+      info.okBefore++;
+  }
+  nelderMead(x, d, FIT_MAX_EVALS, &info.evals, yieldFn);
+  info.cost = nelderMead(x, d, FIT_MAX_EVALS, &info.evals, yieldFn);   // 한 번 더 (국소 정체 벗어나기)
+  out = base;
+  out.perspP = x[0]; out.yScale = x[1]; out.pxPer35 = x[2];
+  out.sideW = x[3]; out.sideK = x[4]; out.sideC = x[5];
+  for (int c = 1; c <= 3; c++) { info.lo[c] = 1e9f; info.hi[c] = -1e9f; info.cnt[c] = 0; }
+  for (int i = 0; i < d.n; i++) {
+    const FitSample &s = d.s[i];
+    SizeMeas m;
+    if (!measureHull(s.hx, s.hy, s.n, x[3 + s.grp], x[0], x[1], x[2], m)) continue;
+    info.lo[s.size] = min(info.lo[s.size], m.lenMm);
+    info.hi[s.size] = max(info.hi[s.size], m.lenMm);
+    info.cnt[s.size]++;
+  }
+  auto bound = [&](int a, int b) {
+    if (info.cnt[a] && info.cnt[b] && info.hi[a] < info.lo[b]) return sqrtf(info.hi[a] * info.lo[b]);
+    return sqrtf(SIZE_NOMINAL_MM[a] * SIZE_NOMINAL_MM[b]);
+  };
+  out.smallMax = bound(1, 2);
+  out.mediumMax = bound(2, 3);
+  // 흰/검 경계: 흰·검 라벨 샘플의 밝기비가 나뉘면 그 사이
+  float wMin = 1e9f, kMax = -1e9f;
+  for (int i = 0; i < d.n; i++) {
+    const FitSample &s = d.s[i];
+    if (s.vRatio <= 0) continue;
+    if (s.colorLabel == 1) wMin = min(wMin, s.vRatio);
+    if (s.colorLabel == 2) kMax = max(kMax, s.vRatio);
+  }
+  if (wMin < 1e8f && kMax > -1e8f && wMin > kMax) out.wbSplit = sqrtf(wMin * kMax);
+  // 검정 보강 아래 폭: 샘플 마스크를 만들 때 쓴 값 (가장 많은 것)
+  int votes[32] = {0}, bestB = base.below, bestV = 0;
+  for (int i = 0; i < d.n; i++) if (d.s[i].below < 32 && ++votes[d.s[i].below] > bestV) { bestV = votes[d.s[i].below]; bestB = d.s[i].below; }
+  out.below = bestB;
+  for (int i = 0; i < d.n; i++) {
+    SizeMeas m;
+    const FitSample &s = d.s[i];
+    if (measureHull(s.hx, s.hy, s.n, x[3 + s.grp], x[0], x[1], x[2], m) && fitSizeOf(m.lenMm, out) == s.size) info.okAfter++;
+  }
+}
+
+// ---- 계산 태스크 (웹 '학습 데이터로 기준 계산') ----
+enum FitState : uint8_t { FIT_IDLE = 0, FIT_RUNNING = 1, FIT_DONE = 2, FIT_FAILED = 3 };
+struct FitJob {
+  volatile uint8_t state = FIT_IDLE;
+  Profile base, result;
+  FitInfo info;
+  unsigned long startMs = 0, ms = 0;
+  char msg[160] = "";
+} fitJob;
+volatile bool customApplyPending = false;   // 웹 '적용' → 메인 루프가 저장·적용
+
+static void fitYieldDelay() { vTaskDelay(1); }   // 코어 0의 IDLE 태스크가 돌 수 있게 (태스크 워치독)
+
+static void fitTaskFn(void *) {
+  FitSample *fs = (FitSample *)heap_caps_malloc(sizeof(FitSample) * SMP_MAX, MALLOC_CAP_SPIRAM);
+  uint8_t *m = (uint8_t *)heap_caps_malloc(ROI_N * 2, MALLOC_CAP_SPIRAM);
+  uint16_t *q = (uint16_t *)heap_caps_malloc(ROI_N * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+  int n = 0, cnt[4] = {0};
+  if (fs && m && q) {
+    for (int k = 0; k < SMP_MAX; k++) {
+      FitSample &f = fs[n];
+      bool use = false;
+      xSemaphoreTake(smpMutex, portMAX_DELAY);
+      if (k < smpCount && smp[k]->sizeLabel >= 1 && smp[k]->sizeLabel <= 3) {
+        const Sample *s = smp[k];
+        for (int i = 0; i < ROI_N; i++) m[i] = ((s->mask[i >> 2] >> ((i & 3) * 2)) & 3) >= 2;   // 선택 덩어리 + 검정 보강
+        f.size = s->sizeLabel;
+        f.colorLabel = s->colorLabel;
+        f.grp = s->color.code == 1 ? 0 : (s->color.code == 2 ? 1 : 2);
+        f.vRatio = s->color.vRatio;
+        f.below = s->below;
+        use = true;
+      }
+      bool more = k < smpCount;
+      xSemaphoreGive(smpMutex);
+      if (!more) break;
+      if (!use) continue;
+      f.n = roiMaskToHull(m, m + ROI_N, q, f.hx, f.hy);
+      if (f.n >= 3) { cnt[f.size]++; n++; }
+      vTaskDelay(1);
+    }
+  }
+  if (!fs || !m || !q) {
+    snprintf(fitJob.msg, sizeof(fitJob.msg), "메모리 부족");
+    fitJob.state = FIT_FAILED;
+  } else if (n < FIT_MIN_SAMPLES || cnt[1] < 2 || cnt[2] < 2 || cnt[3] < 2) {
+    snprintf(fitJob.msg, sizeof(fitJob.msg), "크기 라벨이 있는 샘플이 부족합니다 (소 %d, 중 %d, 대 %d개 — 합계 %d개 이상, 크기마다 2개 이상 필요)",
+             cnt[1], cnt[2], cnt[3], FIT_MIN_SAMPLES);
+    fitJob.state = FIT_FAILED;
+  } else {
+    FitData d = {fs, n};
+    fitProfile(d, fitJob.base, fitJob.result, fitJob.info, fitYieldDelay);
+    snprintf(fitJob.result.name, sizeof(fitJob.result.name), "현장 학습 (샘플 %d개)", n);
+    fitJob.ms = millis() - fitJob.startMs;
+    snprintf(fitJob.msg, sizeof(fitJob.msg), "샘플 %d개로 계산 (%.1f초). 지금 기준 %d/%d → 새 기준 %d/%d",
+             n, fitJob.ms / 1000.0f, fitJob.info.okBefore, n, fitJob.info.okAfter, n);
+    fitJob.state = FIT_DONE;
+  }
+  free(fs); free(m); free(q);
+  vTaskDelete(nullptr);
+}
+
+// 웹에서 시작. 반환: 시작했으면 true
+static bool startFit() {
+  if (fitJob.state == FIT_RUNNING) return false;
+  portENTER_CRITICAL(&profMux);
+  fitJob.base = profView;
+  portEXIT_CRITICAL(&profMux);
+  fitJob.info = FitInfo();
+  fitJob.msg[0] = 0;
+  fitJob.startMs = millis();
+  fitJob.state = FIT_RUNNING;
+  // 코어 0, 낮은 우선순위: Wi-Fi·카메라·웹보다 뒤로 밀리고, 코어 1의 감지·Modbus에는 영향 없음
+  if (xTaskCreatePinnedToCore(fitTaskFn, "fit", 8192, nullptr, 1, nullptr, 0) != pdPASS) {
+    snprintf(fitJob.msg, sizeof(fitJob.msg), "계산 태스크를 만들지 못함");
+    fitJob.state = FIT_FAILED;
+    return false;
+  }
+  return true;
+}
+
+// 메인 루프마다: 웹에서 요청한 기준 바꾸기·현장 학습 적용
+static void serviceProfileRequests() {
+  if (customApplyPending) {
+    customApplyPending = false;
+    if (fitJob.state == FIT_DONE) {
+      profCustom = fitJob.result;
+      profCustomValid = true;
+      profCustomN = fitJob.info.n;
+      if (nvsOk) {
+        nvs.putBytes("cust", &profCustom, sizeof(Profile));
+        nvs.putUShort("custN", profCustomN);
+      }
+      applyProfile(PROF_CUSTOM, true);
+      EVENT("[기준] 현장 학습 기준 저장·적용 (샘플 %u개, 소/중 %.1fmm, 중/대 %.1fmm)", profCustomN, prof.smallMax, prof.mediumMax);
+    }
+  }
+  int r = profRequest;
+  if (r >= 0) {
+    profRequest = -1;
+    if (r == PROF_CUSTOM && !profCustomValid) {
+      EVENT("[기준] 현장 학습 기준이 아직 없음 — '학습 데이터로 기준 계산' 후 적용하세요");
+    } else if (r <= PROF_CUSTOM) {
+      applyProfile(r, true);
+      EVENT("[기준] 판별 기준: %s", prof.name);
+    }
+  }
+}
+
+// 부팅 때: 저장된 설정 읽기 (NVS)
+static void loadSettings() {
+  nvsOk = nvs.begin("cubecam", false);
+  if (!nvsOk) {
+    EVENT("[설정] 저장 공간(NVS)을 열지 못함 — 기본값 사용");
+    applyProfile(PROF_DEFAULT, false);
+    return;
+  }
+  holdMs = nvs.getUShort("hold", HOLD_MS_DEFAULT);
+  if (holdMs > HOLD_MS_MAX) holdMs = HOLD_MS_MAX;
+  if (nvs.getBytesLength("cust") == sizeof(Profile)) {
+    nvs.getBytes("cust", &profCustom, sizeof(Profile));
+    profCustom.name[sizeof(profCustom.name) - 1] = 0;
+    profCustomN = nvs.getUShort("custN", 0);
+    profCustomValid = true;
+  }
+  applyProfile(nvs.getUChar("prof", PROF_DEFAULT), false);
+  EVENT("[설정] 판별 기준: %s · 확정 후 잠금 %.1f초", prof.name, holdMs / 1000.0f);
 }
 
 // ==========================================
@@ -1804,6 +2239,10 @@ td.x{color:var(--bad);font-weight:700}td.o{color:var(--ok)}
 table.wrap td{white-space:normal;vertical-align:top}table.wrap td:first-child{width:56px}
 table.cmdt td:nth-child(2),table.cmdt td:nth-child(5),table.cmdt td:last-child{white-space:nowrap}
 ul.note{padding-left:18px}ul.note li{margin:3px 0}
+.fitbox{margin-top:12px;padding:10px 12px;border:1px solid var(--line);border-radius:8px}
+.profs{display:flex;flex-wrap:wrap;gap:8px}.profs button{text-align:left}.profs button.on{background:#1d3a5c;border-color:var(--acc);color:var(--acc)}
+.profs button small{display:block;color:var(--mute);font-size:11px;font-weight:400}
+input[type=number]{background:#0b0c0e;color:var(--fg);border:1px solid #3c4756;border-radius:6px;padding:5px 8px;font:inherit}
 .thumbs{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 .thumbs img{width:240px;max-width:48%;aspect-ratio:4/3}
 .cm td,.cm th{text-align:center;padding:4px 8px}
@@ -1826,12 +2265,18 @@ details[open] summary{margin-bottom:10px}
  <h2>학습 데이터 수집 <span id="lnPill" class="pill">0개</span><span id="lnMem" class="sub"></span></h2>
  <p class="note" style="margin:0 0 6px">물체를 놓고 <b>초록 사각형(확정)</b>이 되면 정답 버튼을 누르세요. 원본 영상·마스크·측정값이 정답과 함께 장치 메모리에 저장되고, 장치 판정과 비교한 정확도가 아래에 표시됩니다.
  같은 물체에 크기·색상 버튼을 모두 누르면 한 샘플에 함께 기록되며, 잘못 누른 버튼은 다시 누르면 고쳐집니다.
- 판정 기준은 바로 바뀌지 않습니다(모은 데이터로 보정값을 계산해 펌웨어에 반영). <b>전원이 꺼지면 지워지므로</b> 끝나면 ZIP으로 받아 두세요.</p>
- <div class="row lrow"><span class="lk">크기</span><button onclick="learn('s',1)">소 35</button><button onclick="learn('s',2)">중 55</button><button onclick="learn('s',3)">대 85</button></div>
+ 버튼만으로는 판정 기준이 바뀌지 않습니다. 아래 <b>기준 계산</b>으로 장치에서 바로 반영하거나, ZIP으로 받아 PC(tools/size_check.py)에서 분석할 수 있습니다. 샘플은 <b>전원이 꺼지면 지워지므로</b> 끝나면 ZIP으로 받아 두세요.</p>
+ <div class="row lrow"><span class="lk">크기</span><button onclick="learn('s',1)">소 35</button><button onclick="learn('s',2)">중 55</button><button onclick="learn('s',3)">대 75</button></div>
  <div class="row lrow" id="lnColors"><span class="lk">색상</span></div>
  <p class="note" id="lnMsg"></p>
  <div class="thumbs" id="lnThumbs"></div>
  <div id="lnAcc"></div>
+ <div class="fitbox"><b>학습 데이터로 기준 계산 (현장 학습)</b>
+  <p class="note" style="margin:4px 0 6px">위 샘플(크기 라벨이 있는 것, 소·중·대 각 2개 이상, 합계 9개 이상)로 원근·옆면 두께·크기 경계·흰/검 경계를 장치가 직접 계산합니다.
+  펌웨어를 다시 올리지 않아도 됩니다. 계산하는 동안(5~15초)에도 감지와 485 통신은 계속됩니다. 결과를 확인하고 <b>적용</b>하면 '현장 학습' 기준으로 저장되어 바로 쓰이고, 전원이 꺼져도 남습니다.
+  카메라 위치·판 색·조명이 바뀌었을 때 여러 위치·방향의 샘플을 30개 이상 모아 계산하는 것을 권장합니다.</p>
+  <div class="row"><button id="fitBtn" onclick="fitStart()">기준 계산</button><button id="fitApply" onclick="fitApply()" hidden>이 기준 적용 (현장 학습으로 저장)</button><span class="sub" id="fitMsg"></span></div>
+  <div id="fitRes"></div></div>
  <div class="row"><a href="/samples.zip">ZIP으로 모두 받기</a><button onclick="lnDel('last=1','마지막 샘플을 삭제할까요?')">마지막 샘플 삭제</button><button onclick="lnDel('all=1','저장된 샘플을 모두 삭제할까요? (ZIP으로 받아 두었는지 확인)')">전체 삭제</button></div>
  <details style="margin-top:10px"><summary>샘플 목록</summary><div class="tbl"><table>
  <thead><tr><th>#</th><th>크기 정답→판별</th><th>색상 정답→판별</th><th>길이(확정)</th><th>이 프레임 길이×폭</th><th>위치(x,y)</th><th>보강</th><th>영상</th><th></th></tr></thead>
@@ -1851,7 +2296,7 @@ details[open] summary{margin-bottom:10px}
  <div class="tbl"><table>
  <thead><tr><th>주소</th><th>오프셋</th><th>항목</th><th style="text-align:right">값</th><th class="hx">HEX</th><th>접근</th><th>의미</th></tr></thead>
  <tbody id="regs"></tbody></table></div>
- <p class="note" id="mbNote">FC03(Read Holding Registers, 40001~) 또는 FC04(Read Input Registers, 30001~)로 오프셋 0부터 9개를 한 번에 읽으면 됩니다. 두 함수는 같은 값을 돌려줍니다. 오프셋은 0부터 세는 주소입니다(PLC 프레임에 실제로 들어가는 값, 예: 오프셋 3 = 40004/30004 = R 값). 40009는 PLC가 명령을 쓰는 자리입니다(FC06) — 아래 <b>PLC 명령</b> 참고.</p>
+ <p class="note" id="mbNote">FC03(Read Holding Registers, 40001~) 또는 FC04(Read Input Registers, 30001~)로 오프셋 0부터 10개를 한 번에 읽으면 됩니다(앞의 9개만 읽어도 됨). 두 함수는 같은 값을 돌려줍니다. 오프셋은 0부터 세는 주소입니다(PLC 프레임에 실제로 들어가는 값, 예: 오프셋 3 = 40004/30004 = R 값). 40009는 PLC가 명령을 쓰는 자리(아래 <b>PLC 명령</b>), 40010은 확정 후 잠금 시간(ms)으로 PLC가 FC06으로 바꿀 수 있습니다(아래 <b>판별 설정</b>).</p>
 </section>
 <section class="card wide" id="cmdCard">
  <h2>PLC 명령 (40009) <span id="cmdPill" class="pill">대기</span></h2>
@@ -1892,6 +2337,18 @@ details[open] summary{margin-bottom:10px}
  </ul>
  </details>
 </section>
+<section class="card wide" id="setCard">
+ <h2>판별 설정 <span id="profPill" class="pill"></span></h2>
+ <p class="note" style="margin:0 0 6px"><b>판별 기준</b>은 학습 데이터로 맞춘 크기·색 판별 값의 묶음입니다. 카메라 위치·판 색·조명에 따라 맞는 기준이 다르므로 지금 환경에 맞는 것을 고르세요. 고른 기준은 전원이 꺼져도 유지되고, 다음 판정부터 쓰입니다.</p>
+ <div id="profList" class="profs"></div>
+ <details style="margin-top:8px"><summary>기준별 값 보기</summary><div class="tbl" id="profTbl"></div>
+  <p class="note">원근 P·세로 축척 K: 비스듬한 카메라로 찍힌 좌표를 위에서 본 것처럼 펴는 값 · 35mm 폭: 편 좌표에서 단면 35mm의 길이 · 옆면: 물체 아래쪽에 함께 잡히는 카메라 쪽 옆면의 두께(흰·검정·유채색) · 검정 아래 폭: 검정 물체 보강 때 덩어리 바닥 아래로 더 붙이는 폭 · 경계: 추정 길이로 소/중, 중/대를 나누는 값 · 흰/검: 무채색 물체의 밝기비 경계</p></details>
+ <h2 style="margin-top:14px">확정 후 잠금 <span id="holdPill" class="pill"></span></h2>
+ <p class="note" style="margin:0 0 6px">물체가 <b>확정</b>되면 이 시간 동안은 새 색상·크기 판정(새 물체 판정, 다른 물체로 교체, 크기 다시 판정)을 하지 않습니다. 확정 직후 로봇·손이 물체를 집어 옮기는 움직임을 새 물체로 잘못 판정하지 않게 하기 위함입니다.
+ 물체를 치우면 40003(물체 있음)은 잠금 중에도 0이 됩니다. 잠금이 끝나도 물체가 멈춰 있어야(안정화) 판정하므로, 움직임이 이어지면 판정도 계속 미뤄집니다. PLC 명령 1~4는 잠금을 풀고 바로 실행됩니다.
+ PLC는 <b>40010(오프셋 9)</b>에 ms 단위로 쓰면(FC06) 바꿀 수 있습니다(0 = 잠금 없음, 최대 60000).</p>
+ <div class="row"><label>잠금 시간 <input id="holdIn" type="number" min="0" max="60" step="0.5" style="width:80px"> 초</label><button onclick="holdSet()">적용</button><span class="sub" id="holdMsg"></span></div>
+</section>
 <section class="card">
  <h2>통신 상태</h2>
  <dl class="kv" id="mbKv"></dl>
@@ -1913,7 +2370,7 @@ details[open] summary{margin-bottom:10px}
 const $=id=>document.getElementById(id);
 const COLORS=['미감지','흰색','검정색','빨간색','노란색','초록색','파란색'];
 const SW=['','#f2f2f2','#161616','#e53935','#fdd835','#43a047','#1e88e5'];
-const SIZES=['미판별','소(35mm)','중(55mm)','대(85mm)'];
+const SIZES=['미판별','소(35mm)','중(55mm)','대(75mm)'];
 const STATES={EMPTY:['판 비어 있음',''],SETTLING:['안정화 중','warn'],CONFIRMED:['확정','ok']};
 const PIDS={0x26:'OV2640',0x3660:'OV3660',0x5640:'OV5640',0x77:'OV7725'};
 const FCN={1:'Read Coils',2:'Read Discrete Inputs',3:'Read Holding Registers',4:'Read Input Registers',5:'Write Single Coil',6:'Write Single Register',15:'Write Multiple Coils',16:'Write Multiple Registers',22:'Mask Write Register',23:'Read/Write Multiple Registers'};
@@ -1929,10 +2386,11 @@ const REGS=[
  ['감지 누적 횟수',v=>'새 물체가 확정될 때마다 +1 (값이 바뀌면 새 데이터)'],
  ['길이비 ×100',v=>'추정 길이 ÷ 35mm = '+(v/100).toFixed(2)+` (약 ${Math.round(v*0.35)}mm)`],
  ['명령 / 상태',v=>cmdText(v)],
+ ['확정 후 잠금 시간',v=>`${(v/1000).toFixed(1)}초 (ms 단위, 0 = 잠금 없음, 최대 60000)`],
 ];
 const tb=$('regs');
 REGS.forEach((r,i)=>{const tr=document.createElement('tr');
- tr.innerHTML=`<td>${40001+i}</td><td>${i}</td><td>${r[0]}</td><td class="v">-</td><td class="h hx">-</td><td>${i==8?'읽기/쓰기':'읽기'}</td><td class="m"></td>`;tb.appendChild(tr);});
+ tr.innerHTML=`<td>${40001+i}</td><td>${i}</td><td>${r[0]}</td><td class="v">-</td><td class="h hx">-</td><td>${i>=8?'읽기/쓰기':'읽기'}</td><td class="m"></td>`;tb.appendChild(tr);});
 let prevRegs=null,lastOk=0;
 const pill=(el,t,c)=>{el.textContent=t;el.className='pill '+(c||'');};
 const kv=(el,rows)=>{el.innerHTML=rows.map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join('');};
@@ -1958,6 +2416,8 @@ function render(j){
   ['현재 프레임 색',j.color.samples>0?`${j.color.name} · RGB(${j.color.rgb.join(', ')})`:'-']];
  if(j.state=='SETTLING')rows.push(['안정화',`${j.stable}프레임`]);
  if(j.state=='CONFIRMED')rows.push(['확정 위치 점유율',`${Math.round(j.spot.occupancy*100)}% (35% 미만이 이어지면 제거로 판정)`]);
+ if(j.hold&&j.hold.active)rows.push(['확정 후 잠금',`<span class="pill warn">새 판정 멈춤</span> ${(j.hold.remainMs/1000).toFixed(1)}초 남음`]);
+ if(j.profile)rows.push(['판별 기준',j.profile.name]);
  kv($('nowKv'),rows);
  [...tb.rows].forEach((tr,i)=>{const v=regs[i];tr.cells[3].textContent=v;tr.cells[4].textContent='0x'+v.toString(16).toUpperCase().padStart(4,'0');tr.cells[6].textContent=REGS[i][1](v);
   if(prevRegs&&prevRegs[i]!==v){tr.classList.add('flash');setTimeout(()=>tr.classList.remove('flash'),80);}});
@@ -1975,10 +2435,11 @@ function render(j){
   if(m.requests){r.push(['함수',`FC${String(m.lastFc).padStart(2,'0')} ${FCN[m.lastFc]||''}`],['대상',regRange(m.lastFc,m.lastAddr,m.lastArg)],['결과',m.lastOk?'<span class="pill ok">정상 응답</span>':'<span class="pill bad">오류 응답</span> 주소 범위/함수 코드 확인']);}
   kv($('mbKv'),r);
   if(m.requests==0)hint='요청이 한 번도 없으면 ESP32-CAM-MB가 빠져 있는지 확인하고, TXD/RXD 연결을 서로 바꿔 보고, 485 배선(A/B), 보오율, 슬레이브 ID를 확인하세요. CRC 오류나 다른 ID로 보낸 요청은 집계되지 않습니다.';
-  else if(m.requests>m.ok)hint='오류 응답은 없는 주소(오프셋 9 이후 = 40010/30010 이후)나 지원하지 않는 함수 코드(FC03·FC04·FC06·FC16 외)를 요청했을 때 생깁니다.';
+  else if(m.requests>m.ok)hint='오류 응답은 없는 주소(오프셋 10 이후 = 40011/30011 이후)나 지원하지 않는 함수 코드(FC03·FC04·FC06·FC16 외)를 요청했을 때 생깁니다.';
  }
  $('mbHint').textContent=hint;
  renderCmd(j.cmd);
+ renderSettings(j);
  const cam=j.camera,w=j.wifi;
  kv($('sysKv'),[
   ['카메라',cam.ok?`<span class="pill ok">정상</span> ${PIDS[cam.pid]||''} (PID 0x${cam.pid.toString(16).toUpperCase()})`:'<span class="pill bad">초기화 실패</span> 배선/전원 확인 후 재부팅'],
@@ -2149,8 +2610,74 @@ function renderCmd(k){
  }
 }
 function relearn(){cmd(2);}
+// 판별 설정: 판별 기준(프로필) · 확정 후 잠금
+const PROF_DESC={0:'은색 판, 처음 카메라 위치',1:'노란 테이프 판, 옮긴 카메라 위치 (기본)',2:'웹 학습 모드 샘플로 장치에서 계산'};
+let profIdx=-1,profData=null;
+async function loadProfiles(){
+ try{profData=await(await fetch('/profile',{cache:'no-store'})).json();}catch(e){return;}
+ const P=profData.profiles;
+ $('profList').innerHTML=P.map(p=>`<button class="${p.index==profData.current?'on':''}" ${p.valid?'':'disabled'} onclick="selectProfile(${p.index})">${p.name}${p.index==profData.current?' — 사용 중':''}<small>${PROF_DESC[p.index]||''}${p.index==2&&p.valid&&p.samples?` · 샘플 ${p.samples}개`:''}</small></button>`).join('');
+ const f=(k,d)=>P.map(p=>`<td>${p.valid?(+p[k]).toFixed(d):'-'}</td>`).join('');
+ $('profTbl').innerHTML=`<table><thead><tr><th>값</th>${P.map(p=>`<th>${p.name}</th>`).join('')}</tr></thead><tbody>`+
+  [['원근 P','perspP',5],['세로 축척 K','yScale',4],['35mm 폭(px)','pxPer35',2],['옆면 흰','sideW',2],['옆면 검정','sideK',2],['옆면 유채색','sideC',2],
+   ['검정 아래 폭(px)','below',0],['소/중 경계(mm)','smallMax',1],['중/대 경계(mm)','mediumMax',1],['흰/검 경계','wbSplit',2]]
+  .map(([n,k,d])=>`<tr><td>${n}</td>${f(k,d)}</tr>`).join('')+'</tbody></table>';
+}
+async function selectProfile(i){
+ const p=profData&&profData.profiles[i];
+ if(!p||!p.valid||i==profData.current)return;
+ if(!confirm(`판별 기준을 '${p.name}'(으)로 바꿀까요?\n다음 판정부터 쓰이고, 전원이 꺼져도 유지됩니다.`))return;
+ try{await fetch(`/profile?sel=${i}`,{cache:'no-store'});}catch(e){}
+ setTimeout(loadProfiles,800);
+}
+function renderSettings(j){
+ if(!j.profile)return;
+ pill($('profPill'),j.profile.name,'ok');
+ if(j.profile.index!==profIdx){profIdx=j.profile.index;loadProfiles();}
+ const h=j.hold;
+ pill($('holdPill'),h.active?`잠금 중 · ${(h.remainMs/1000).toFixed(1)}초 남음`:(h.ms?`${(h.ms/1000).toFixed(1)}초`:'잠금 없음'),h.active?'warn':'');
+ const inp=$('holdIn');if(document.activeElement!==inp)inp.value=(h.ms/1000).toFixed(1);
+ if(j.fitState==1&&!fitTimer){$('fitBtn').disabled=true;fitPoll();}   // 새로고침해도 계산 진행을 이어서 표시
+}
+async function holdSet(){
+ const s=parseFloat($('holdIn').value);
+ if(!(s>=0&&s<=60)){$('holdMsg').textContent='0~60초로 넣으세요';return;}
+ try{const j=await(await fetch(`/config?hold=${Math.round(s*1000)}`,{cache:'no-store'})).json();
+  $('holdMsg').textContent=j.ok?`적용됨: ${s}초 (40010 = ${j.hold})`:j.error;}catch(e){$('holdMsg').textContent='장치 응답 없음';}
+}
+// 현장 학습: 학습 샘플로 기준 계산
+let fitTimer=null;
+async function fitStart(){
+ if(!confirm('저장된 학습 샘플로 판별 기준을 계산합니다 (5~15초).\n계산만 하고, 적용은 결과를 본 뒤 따로 누릅니다.'))return;
+ $('fitApply').hidden=true;$('fitRes').innerHTML='';
+ try{const j=await(await fetch('/fit?start=1',{cache:'no-store'})).json();
+  if(j.error){$('fitMsg').textContent=j.error;}
+ }catch(e){$('fitMsg').textContent='장치 응답 없음';return;}
+ $('fitBtn').disabled=true;fitPoll();
+}
+async function fitPoll(){
+ clearTimeout(fitTimer);
+ let j;try{j=await(await fetch('/fit',{cache:'no-store'})).json();}catch(e){fitTimer=setTimeout(fitPoll,1500);return;}
+ if(j.state==1){$('fitMsg').textContent=`계산 중… ${(j.elapsedMs/1000).toFixed(0)}초`;fitTimer=setTimeout(fitPoll,1000);return;}
+ fitTimer=null;$('fitBtn').disabled=false;
+ $('fitMsg').textContent=j.msg||'';
+ if(j.state!=2)return;
+ const r=j.result,R=j.ranges,names=['소','중','대'];
+ $('fitRes').innerHTML=`<dl class="kv" style="margin-top:8px"><dt>크기 정확도</dt><dd>지금 기준(${j.baseName}) ${j.okBefore}/${j.n} → <b>새 기준 ${j.okAfter}/${j.n}</b></dd>`+
+  `<dt>크기별 측정 범위</dt><dd>${R.map((x,i)=>x[2]?`${names[i]} ${x[0].toFixed(1)}~${x[1].toFixed(1)}mm (${x[2]}개)`:'').filter(Boolean).join(' · ')}</dd>`+
+  `<dt>새 경계</dt><dd>소/중 ${r.smallMax.toFixed(1)}mm · 중/대 ${r.mediumMax.toFixed(1)}mm · 흰/검 ${r.wbSplit.toFixed(2)}</dd>`+
+  `<dt>새 보정값</dt><dd>원근 P ${r.perspP.toFixed(5)} · K ${r.yScale.toFixed(4)} · 35mm ${r.pxPer35.toFixed(2)}px · 옆면 흰 ${r.sideW.toFixed(1)} / 검 ${r.sideK.toFixed(1)} / 색 ${r.sideC.toFixed(1)} · 검정 아래 ${r.below}px</dd></dl>`+
+  (j.okAfter<j.okBefore?'<p class="note"><span class="pill bad">주의</span> 새 기준이 지금 기준보다 덜 맞습니다. 라벨이 잘못된 샘플이 없는지 확인하세요.</p>':'');
+ $('fitApply').hidden=false;
+}
+async function fitApply(){
+ if(!confirm('계산한 기준을 \'현장 학습\'으로 저장하고 바로 씁니다.\n이전 현장 학습 기준은 덮어씁니다. 학습 1·2 기준은 그대로 남아 언제든 다시 고를 수 있습니다.'))return;
+ try{const j=await(await fetch('/fit?apply=1',{cache:'no-store'})).json();
+  $('fitMsg').textContent=j.error||'적용했습니다 — 판별 설정에서 현장 학습이 사용 중으로 바뀝니다';$('fitApply').hidden=true;}catch(e){}
+ setTimeout(loadProfiles,800);
+}
 $('s').src='http://'+location.hostname+':81/stream';
-pollStatus();pollLog();lnApply();setInterval(()=>{if(lnOn)lnLoad();},10000);
+pollStatus();pollLog();lnApply();loadProfiles();setInterval(()=>{if(lnOn)lnLoad();},10000);
 </script></body></html>)rawliteral";
 
 static esp_err_t index_handler(httpd_req_t *req) {
@@ -2236,6 +2763,18 @@ static esp_err_t status_handler(httpd_req_t *req) {
   // 카메라 · Wi-Fi · 시스템
   unsigned long now = millis();
   unsigned long lastFrame = lastFrameMs;
+  // 판별 기준 · 확정 후 잠금
+  char profName[sizeof(Profile::name)];
+  portENTER_CRITICAL(&profMux);
+  memcpy(profName, profView.name, sizeof(profName));
+  portEXIT_CRITICAL(&profMux);
+  bool hOn = holdOn;
+  unsigned long hEl = now - holdStartMs;
+  bool hAct = hOn && hEl < holdMs;
+  n = jsonAppend(json, cap, n,
+    ",\"profile\":{\"index\":%d,\"name\":\"%s\"},\"hold\":{\"ms\":%u,\"active\":%s,\"remainMs\":%lu},\"fitState\":%u",
+    profIndex, profName, (unsigned)holdMs, hAct ? "true" : "false", hAct ? (unsigned long)(holdMs - hEl) : 0UL,
+    (unsigned)fitJob.state);
   n = jsonAppend(json, cap, n,
     ",\"fw\":\"" FW_VERSION "\",\"samples\":%d,\"uptime\":%lu,\"loopGapMs\":%lu,\"loopGapMaxMs\":%lu,\"heap\":%u,\"psram\":%u,"
     "\"camera\":{\"ok\":%s,\"pid\":%u,\"fails\":%lu,\"lastFrameAgo\":%ld},"
@@ -2477,10 +3016,10 @@ static size_t sampleJson(char *o, size_t cap, const Sample *s, bool full) {
   const BlobInfo &b = s->blob;
   size_t n = snprintf(o, cap,
     "{\"id\":%u,\"det\":%u,\"ms\":%lu,\"size\":%u,\"color\":%u,\"predSize\":%u,\"predColor\":%u,\"confLenMm\":%.1f,"
-    "\"frameSize\":%u,\"lenMm\":%.1f,\"widMm\":%.1f,\"grown\":%d,"
+    "\"frameSize\":%u,\"lenMm\":%.1f,\"widMm\":%.1f,\"grown\":%d,\"prof\":%d,\"below\":%u,"
     "\"area\":%d,\"cx\":%.2f,\"cy\":%.2f,\"len\":%.2f,\"wid\":%.2f,\"ratio\":%.3f,\"angle\":%.1f",
     s->id, s->det, (unsigned long)s->ms, s->sizeLabel, s->colorLabel, s->predSize, s->predColor, s->confLenMm,
-    s->frameSize, b.lenMm, b.widMm, b.grown, b.area, b.cx, b.cy, b.len, b.wid, b.ratio, b.angleDeg);
+    s->frameSize, b.lenMm, b.widMm, b.grown, s->profIdx, s->below, b.area, b.cx, b.cy, b.len, b.wid, b.ratio, b.angleDeg);
   if (full && n < cap) {
     const ColorInfo &c = s->color;
     char fr[40], fm[40];
@@ -2501,22 +3040,26 @@ static size_t sampleJson(char *o, size_t cap, const Sample *s, bool full) {
 
 // 전체 메타데이터 + 샘플 목록 JSON (PSRAM 버퍼를 할당해 반환, 호출자가 free)
 static char *samplesJson(bool full, size_t *outLen) {
-  size_t cap = 2048 + (size_t)SMP_MAX * (full ? 820 : 390);
+  size_t cap = 2048 + (size_t)SMP_MAX * (full ? 850 : 420);
   char *o = (char *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
   if (!o) return nullptr;
+  Profile pv;
+  portENTER_CRITICAL(&profMux);
+  pv = profView;
+  portEXIT_CRITICAL(&profMux);
   xSemaphoreTake(smpMutex, portMAX_DELAY);
   size_t n = snprintf(o, cap,
     "{\"fw\":\"%s\",\"host\":\"%s\",\"count\":%d,\"max\":%d,\"psramFree\":%u,"
     "\"img\":[%d,%d],\"roi\":[%d,%d,%d,%d],"
-    "\"sizeModel\":{\"perspP\":%.5f,\"yScale\":%.4f,\"pxPer35mm\":%.2f,\"sidePx\":%.1f,\"smallMaxMm\":%.1f,\"mediumMaxMm\":%.1f,"
-    "\"blackGrowCols\":%d,\"whiteBlackSplit\":%.2f},"
-    "\"sizeNames\":[\"미입력\",\"소(35mm)\",\"중(55mm)\",\"대(85mm)\"],"
+    "\"sizeModel\":{\"name\":\"%s\",\"perspP\":%.5f,\"yScale\":%.4f,\"pxPer35mm\":%.2f,\"sideW\":%.2f,\"sideK\":%.2f,\"sideC\":%.2f,"
+    "\"below\":%d,\"smallMaxMm\":%.1f,\"mediumMaxMm\":%.1f,\"blackGrowCols\":%d,\"whiteBlackSplit\":%.2f,\"nominalMm\":[35,55,75]},"
+    "\"sizeNames\":[\"미입력\",\"소(35mm)\",\"중(55mm)\",\"대(75mm)\"],"
     "\"colorNames\":[\"미입력\",\"흰색\",\"검정색\",\"빨간색\",\"노란색\",\"초록색\",\"파란색\"],"
     "\"maskLevels\":\"0 배경, 1 다른 덩어리, 2 선택 덩어리, 3 검정 보강 픽셀\",\"backgrounds\":[",
     FW_VERSION, HOSTNAME, smpCount, SMP_MAX, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
     IMG_W, IMG_H, ROI_X0, ROI_Y0, ROI_X1, ROI_Y1,
-    SIZE_PERSP_P, SIZE_Y_SCALE, SIZE_PX_PER_35MM, SIDE_FACE_PX, SIZE_SMALL_MAX_MM, SIZE_MEDIUM_MAX_MM,
-    BLACK_GROW_COLS, WHITE_BLACK_SPLIT);
+    pv.name, pv.perspP, pv.yScale, pv.pxPer35, pv.sideW, pv.sideK, pv.sideC, pv.below, pv.smallMax, pv.mediumMax,
+    BLACK_GROW_COLS, pv.wbSplit);
   for (int k = 0; k < bgSnapCount && n < cap; k++)
     n += snprintf(o + n, cap - n, "%s{\"bg\":%d,\"ver\":%u,\"ms\":%lu,\"file\":\"bg%d.bmp\"}", k ? "," : "", k,
                   bgSnap[k].ver, (unsigned long)bgSnap[k].ms, k);
@@ -2552,6 +3095,80 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+}
+
+// 판별 기준 하나의 JSON
+static size_t profileJson(char *o, size_t cap, int idx, const Profile &p, bool valid, int nSamples) {
+  return snprintf(o, cap,
+    "{\"index\":%d,\"name\":\"%s\",\"valid\":%s,\"samples\":%d,\"perspP\":%.5f,\"yScale\":%.4f,\"pxPer35\":%.2f,"
+    "\"sideW\":%.2f,\"sideK\":%.2f,\"sideC\":%.2f,\"below\":%d,\"smallMax\":%.1f,\"mediumMax\":%.1f,\"wbSplit\":%.2f}",
+    idx, valid ? p.name : "현장 학습 (아직 없음)", valid ? "true" : "false", nSamples, p.perspP, p.yScale, p.pxPer35,
+    p.sideW, p.sideK, p.sideC, p.below, p.smallMax, p.mediumMax, p.wbSplit);
+}
+
+// /profile : 판별 기준 목록과 지금 쓰는 번호. /profile?sel=N : 그 기준으로 바꾸기 (메인 루프가 적용·저장)
+static esp_err_t profile_handler(httpd_req_t *req) {
+  int sel = queryInt(req, "sel", -1);
+  if (sel >= 0 && sel <= PROF_CUSTOM) profRequest = sel;
+  static char o[1400];
+  size_t n = snprintf(o, sizeof(o), "{\"current\":%d,\"requested\":%d,\"default\":%d,\"profiles\":[",
+                      profIndex, sel, PROF_DEFAULT);
+  for (int i = 0; i < PROF_BUILTIN_N && n < sizeof(o); i++) {
+    n += profileJson(o + n, sizeof(o) - n, i, PROFILE_BUILTIN[i], true, 0);
+    if (n < sizeof(o)) o[n++] = ',';
+  }
+  if (n < sizeof(o)) n += profileJson(o + n, sizeof(o) - n, PROF_CUSTOM, profCustom, profCustomValid, profCustomN);
+  if (n < sizeof(o)) n += snprintf(o + n, sizeof(o) - n, "]}");
+  if (n >= sizeof(o)) return httpd_resp_send_500(req);
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, o, n);
+}
+
+// /fit?start=1 : 학습 샘플로 기준 계산 시작 / /fit : 진행·결과 / /fit?apply=1 : 결과를 현장 학습 기준으로 저장·적용
+static esp_err_t fit_handler(httpd_req_t *req) {
+  bool started = false;
+  const char *err = "";
+  if (queryInt(req, "start", 0) == 1) {
+    started = startFit();
+    if (!started && fitJob.state == FIT_RUNNING) err = "이미 계산 중입니다";
+  }
+  if (queryInt(req, "apply", 0) == 1) {
+    if (fitJob.state == FIT_DONE) customApplyPending = true;
+    else err = "적용할 계산 결과가 없습니다";
+  }
+  static char o[1200];
+  const FitInfo &fi = fitJob.info;
+  size_t n = snprintf(o, sizeof(o),
+    "{\"state\":%u,\"started\":%s,\"error\":\"%s\",\"msg\":\"%s\",\"elapsedMs\":%lu,\"n\":%d,\"evals\":%d,"
+    "\"okBefore\":%d,\"okAfter\":%d,\"cost\":%.4f,\"baseName\":\"%s\","
+    "\"ranges\":[[%.1f,%.1f,%d],[%.1f,%.1f,%d],[%.1f,%.1f,%d]],\"result\":",
+    fitJob.state, started ? "true" : "false", err, fitJob.msg,
+    fitJob.state == FIT_RUNNING ? millis() - fitJob.startMs : fitJob.ms, fi.n, fi.evals, fi.okBefore, fi.okAfter, fi.cost,
+    fitJob.base.name, fi.lo[1], fi.hi[1], fi.cnt[1], fi.lo[2], fi.hi[2], fi.cnt[2], fi.lo[3], fi.hi[3], fi.cnt[3]);
+  if (n < sizeof(o)) n += profileJson(o + n, sizeof(o) - n, PROF_CUSTOM, fitJob.result, fitJob.state == FIT_DONE, fi.n);
+  if (n < sizeof(o)) n += snprintf(o + n, sizeof(o) - n, "}");
+  if (n >= sizeof(o)) return httpd_resp_send_500(req);
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, o, n);
+}
+
+// /config?hold=ms : 확정 후 잠금 시간 (PLC가 40010에 쓰는 것과 같음)
+static esp_err_t config_handler(httpd_req_t *req) {
+  int hold = queryInt(req, "hold", -1);
+  char o[96];
+  if (hold < 0 || hold > 65535) {
+    snprintf(o, sizeof(o), "{\"ok\":false,\"error\":\"hold는 0~%u (ms)\"}", HOLD_MS_MAX);
+  } else {
+    webHoldPending = true;
+    mbLock();
+    setReg(REG_HOLD_MS, (uint16_t)hold);
+    mbUnlock();
+    snprintf(o, sizeof(o), "{\"ok\":true,\"hold\":%d}", hold);
+  }
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  return httpd_resp_send(req, o, HTTPD_RESP_USE_STRLEN);
 }
 
 // /learn?s=1..3 (크기) 또는 /learn?c=1..6 (색상): 메인 루프가 확정 상태 프레임에서 저장할 때까지 기다린다
@@ -2783,6 +3400,9 @@ void startWebServers() {
     {.uri = "/raw.bmp", .method = HTTP_GET, .handler = raw_bmp_handler, .user_ctx = NULL},
     {.uri = "/relearn", .method = HTTP_GET, .handler = relearn_handler, .user_ctx = NULL},
     {.uri = "/cmd", .method = HTTP_GET, .handler = cmd_handler, .user_ctx = NULL},
+    {.uri = "/profile", .method = HTTP_GET, .handler = profile_handler, .user_ctx = NULL},
+    {.uri = "/fit", .method = HTTP_GET, .handler = fit_handler, .user_ctx = NULL},
+    {.uri = "/config", .method = HTTP_GET, .handler = config_handler, .user_ctx = NULL},
     {.uri = "/wifiscan", .method = HTTP_GET, .handler = wifiscan_handler, .user_ctx = NULL},
     {.uri = "/learn", .method = HTTP_GET, .handler = learn_handler, .user_ctx = NULL},
     {.uri = "/samples", .method = HTTP_GET, .handler = samples_handler, .user_ctx = NULL},
@@ -2790,7 +3410,7 @@ void startWebServers() {
     {.uri = "/sample_del", .method = HTTP_GET, .handler = sample_del_handler, .user_ctx = NULL},
     {.uri = "/samples.zip", .method = HTTP_GET, .handler = samples_zip_handler, .user_ctx = NULL},
   };
-  config.max_uri_handlers = 16;
+  config.max_uri_handlers = 20;
   if (httpd_start(&web_httpd, &config) == ESP_OK) {
     for (auto &u : uris) httpd_register_uri_handler(web_httpd, &u);
   }
@@ -3053,9 +3673,12 @@ void setup() {
   footMask = (uint8_t *)allocBig(IMG_N);
   if (footMask) memset(footMask, 0, IMG_N);
   measMask = (uint8_t *)allocBig(IMG_N);
-  measTmp = (uint8_t *)allocBig(IMG_N);
   if (measMask) memset(measMask, 0, IMG_N);
+  roiMask = (uint8_t *)allocBig(ROI_N);
+  roiTmp = (uint8_t *)allocBig(ROI_N);
+  roiQueue = (uint16_t *)allocBig(ROI_N * sizeof(uint16_t));
   initSizeTables();
+  loadSettings();   // 판별 기준·확정 후 잠금 시간 (NVS)
   if (ENABLE_WEB) {
     dbgBuf = (uint8_t *)allocBig(DBG_W * DBG_H * 2);
     rawBuf = (uint8_t *)allocBig(IMG_N * 2);
@@ -3064,7 +3687,7 @@ void setup() {
     if (rawBuf) memset(rawBuf, 0, IMG_N * 2);
     if (!dbgBuf || !rawBuf) { dbgBuf = nullptr; EVENT("[ERR] 디버그 버퍼 할당 실패"); }
   }
-  if (!bgR || !bgG || !bgB || !fgRaw || !fgMap || !bfsQueue || !footMask || !measMask || !measTmp) {
+  if (!bgR || !bgG || !bgB || !fgRaw || !fgMap || !bfsQueue || !footMask || !measMask || !roiMask || !roiTmp || !roiQueue) {
     LOG("[ERR] 작업 버퍼 할당 실패\n");
     while (true) { delay(1000); }
   }
@@ -3098,6 +3721,7 @@ void setup() {
     EVENT("[485] Modbus RTU 시작: 슬레이브 ID %d, %dbps 8N1, FC03 40001~%d / FC04 30001~%d (UART0 TX=GPIO%d RX=GPIO%d)",
           SLAVE_ID, MODBUS_BAUD, 40000 + REG_COUNT, 30000 + REG_COUNT, MB_TX_PIN, MB_RX_PIN);
   }
+  publishHold();   // 40010 = 저장된 확정 후 잠금 시간
 
   // Wi-Fi는 기다리지 않는다 (Modbus 운용 중 Wi-Fi가 없어도 멈추지 않게). 연결되면 networkTask()가 웹 서버를 시작
   if (ENABLE_WEB) {
@@ -3156,6 +3780,8 @@ void loop() {
     mbUnlock();
   }
   pollCommand();   // 40009 명령 접수 (PLC 또는 웹)
+  pollHoldReg();   // 40010 확정 후 잠금 시간 (PLC 또는 웹)
+  serviceProfileRequests();   // 웹에서 고른 판별 기준·현장 학습 적용
   networkTask();
 
   if (cameraOk) {
